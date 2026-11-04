@@ -6,7 +6,7 @@
     "name": "lbzepoqo",
     "url": "https://github.com/lbzepoqo"
   },
-  "repository": "https://github.com/lbzepoqo/claude-plugins",
+  "repository": "https://github.com/lbzepoqo/compact-timing",
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
