@@ -49,7 +49,7 @@ claude plugin marketplace add lbzepoqo/compact-timing
 claude plugin install compact-timing@compact-timing
 ```
 
-Restart Claude Code. If you installed it earlier as `compact-timing@lbzepoqo`, that install keeps updating from this repo, so nothing for you to do.
+Restart Claude Code. The `lbzepoqo/claude-plugins` marketplace also lists it, as `compact-timing@lbzepoqo`, from this repo.
 
 ## Settings
 
@@ -67,7 +67,7 @@ echo '{"boundaryTokens": "150000"}' | claude plugin configure compact-timing@com
 
 ## In daily use
 
-In three weeks of my own sessions, Claude Code's hard-limit compaction never ran, and the plugin compacted 251 times. The weak spot was long turns: 37% of those compactions ran past `softTokens`, because a turn kept growing until it ended. Compact and resume in 0.9.0 is the fix, and in a live test Sonnet compacted and resumed twice in a three-step task without help.
+In three weeks of my own sessions (`boundaryTokens` 120k, `softTokens` 200k), Claude Code's hard-limit compaction never ran, and the plugin compacted 251 times. The weak spot was long turns: 37% of those compactions ran at 200k or more, because a turn kept growing until it ended. Compact and resume in 0.9.0 is aimed at that; in a live test Sonnet compacted and resumed twice in a three-step task without help.
 
 ## Limits
 

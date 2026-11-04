@@ -81,11 +81,15 @@ export const sizeNudge = (tokens: number, toolName: string) =>
 export const shouldNudge = (current: Mark | null, tokens: number | undefined, isNudged: boolean, limits: Limits): boolean =>
   !isNudged && current?.resume !== true && tokens !== undefined && tokens >= limits.softTokens
 
-/** The prompt sent after a compaction the model asked to resume from. */
+/**
+ * The prompt sent after a compaction the model asked to resume from. The model may have kept working after it set the
+ * mark, so the summary, being newer, decides which steps are done.
+ */
 export const resumePrompt = (focus: string) =>
   [
     'compact-timing: an automatic prompt from a plugin, not written by the user. The plugin compacted the conversation at the `boundary` mark you set with `resume`.',
     `Continue the user's request from where you stopped${focus ? `: ${focus}` : '.'}`,
+    'The summary is newer than this focus: skip any step it shows done, and check before repeating a commit, push or deploy.',
   ].join('\n')
 
 /** The first summary line, so the user and the model can tell a plugin compaction from a typed /compact: both are recorded as `manual`. */
