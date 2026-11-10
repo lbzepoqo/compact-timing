@@ -6,6 +6,7 @@ declare module 'claude-code' {
       noted: boolean
       nudged: boolean
       resumes: number
+      ownCompact: 'pending' | { skip: string | null } | null
     }
   }
 }

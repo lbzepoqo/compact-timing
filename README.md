@@ -22,11 +22,11 @@ After a `git commit`, the plugin reminds the model to set the mark when the cont
 
 ### Compact and resume
 
-A plugin can compact only between turns, and a long turn (a feature build, a whole debugging session) keeps growing until it ends. So when steps of the current request remain, the model sets `boundary` with `resume` at a point where the work is saved. When the context has reached `boundaryTokens`, the tool answer tells the model to end the turn with a one-line status. The plugin compacts and then sends the focus back as a prompt, so the work goes on without you typing "continue". An interrupted turn or a skipped compaction sends no prompt. After 10 automatic resumes without a prompt from you, the plugin stops and says so in a toast. A message you queue during the long turn may run before or after the resume prompt.
+A plugin can compact only between turns, and a long turn (a feature build, a whole debugging session) keeps growing until it ends. So when steps of the current request remain, the model sets `boundary` with `resume` at a point where the work is saved. When the context has reached `boundaryTokens`, the tool answer tells the model to end the turn with a one-line status. The plugin compacts and then sends the focus back as a prompt, so the work goes on without you typing "continue". An interrupted turn or a skipped compaction sends no prompt. After 10 automatic resumes without a prompt from you, the plugin stops and says so in a toast and a transcript line. A message you queue during the long turn may run before or after the resume prompt.
 
 Inside a turn, the first tool result that finds the context at `softTokens` or more carries a note: at the next saved point, set `boundary` with `resume` and end the turn. The note comes once until the next compaction.
 
-Every plugin compaction shows a toast with the size, and its summary starts with "Compacted by the compact-timing plugin at 214k tokens, at a `boundary` mark". Claude Code records a plugin compaction with the trigger `manual`, the same as a `/compact` you type, so without the line neither you nor the model can tell them apart afterward.
+The plugin compacts by running `/compact` with the label and the focus as its arguments, so the transcript shows that command as a prompt from the plugin. It does not use the plugin API's direct compaction, which does not work in a headless or SDK session (T3 Code, `claude -p`). Every plugin compaction shows a toast with the size, and its summary starts with "Compacted by the compact-timing plugin at 214k tokens, at a `boundary` mark". Claude Code records a plugin compaction with the trigger `manual`, the same as a `/compact` you type, so without the line neither you nor the model can tell them apart afterward. A compaction that fails or is skipped shows a toast and a line in the transcript, which an SDK host shows too.
 
 ### Topic switches
 
@@ -73,7 +73,7 @@ In three weeks of my own sessions (`boundaryTokens` 120k, `softTokens` 200k), Cl
 
 - In a test, Opus, Sonnet and Haiku each set `boundary` with a useful focus after they committed a bug fix. None of them set `busy` while it searched for the bug. Without the commit reminder, Opus set no mark at all.
 - In a test of a manual `/compact` on a short session, the summaries of Opus, Sonnet and Haiku each ended with the transcript search line.
-- Headless sessions (`claude -p`, the SDK) cannot compact from a plugin yet. In these sessions the plugin shows a "compaction failed" message and nothing else changes.
+- Before 0.9.1, the plugin never compacted in a headless or SDK session (T3 Code, `claude -p`), and the only sign was a toast that SDK hosts do not show. The `/compact` path was tested in both an SDK session and the terminal.
 
 ## Develop
 

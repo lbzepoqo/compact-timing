@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { armedMark, compactInstructions, contextNote, contextNoteDue, isCommit, limitOption, markResult, openUserSteps, parseMark, resumePrompt, ruleText, shouldCompact, shouldNudge, shouldRemind, sizeNudge, summaryLabel, transcriptSearch, turnEnd } from '../hooks/register'
+import { armedMark, compactInstructions, contextNote, contextNoteDue, isCommit, limitOption, markResult, openUserSteps, ownCompactFailure, parseMark, pluginCompactArgs, resumePrompt, ruleText, shouldCompact, shouldNudge, shouldRemind, sizeNudge, summaryLabel, transcriptSearch, turnEnd } from '../hooks/register'
 
 const limits = { boundaryTokens: 200_000, softTokens: 300_000 }
 
@@ -119,6 +119,22 @@ test('the size nudge comes once from the soft limit, not while a resume is armed
 test('a plugin compaction labels its summary', () => {
   expect(summaryLabel({ state: 'boundary', focus: '', resume: false }, 214_000)).toContain('compact-timing plugin at 214k tokens, at a `boundary` mark')
   expect(summaryLabel(null, 301_000)).toContain('at the soft limit with no mark')
+})
+
+test('the plugin compacts with /compact, its label and focus as the arguments, the standing instructions once', () => {
+  const boundary = { state: 'boundary' as const, focus: 'Next: deploy.', resume: false }
+  const args = pluginCompactArgs(boundary, 214_000)
+  expect(args).toBe(`${summaryLabel(boundary, 214_000)}\n\nNext: deploy.`)
+  expect(pluginCompactArgs(null, 301_000)).toBe(summaryLabel(null, 301_000))
+  // The compaction hook sees it as a typed /compact and adds the standing instructions after it.
+  expect(compactInstructions('manual', args, boundary)).toBe(`${args}\n\n${openUserSteps}\n\n${transcriptSearch}`)
+})
+
+test('the plugin compaction counts only when its compaction hook saw it stand', () => {
+  expect(ownCompactFailure({ skip: null })).toBe(null)
+  expect(ownCompactFailure({ skip: 'blocked by a hook' })).toBe('compaction skipped (blocked by a hook)')
+  expect(ownCompactFailure('pending')).toBe('the compaction did not run')
+  expect(ownCompactFailure(null)).toBe('the compaction did not run')
 })
 
 test('a resume is stored only when the context can compact now', () => {

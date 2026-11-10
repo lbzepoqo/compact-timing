@@ -13,6 +13,10 @@ const nudged = atom({ plugin: 'compact-timing', key: 'nudged' } as const, false)
 // Automatic resumes since the user's last request, so a model that always sets `resume` cannot run unattended for long.
 const resumes = atom({ plugin: 'compact-timing', key: 'resumes' } as const, 0)
 const maxResumes = 10
+// The plugin's own `/compact` while it runs: `pending` until the compaction hook sees it, then its outcome. Its trigger
+// is `manual`, the same as a typed `/compact`, and the command's result says nothing about a skip.
+export type OwnCompact = 'pending' | { skip: string | null } | null
+const ownCompact = atom({ plugin: 'compact-timing', key: 'ownCompact' } as const, null as OwnCompact)
 
 /** The tool input as the model sends it, or null when the state is not one of the two. */
 export const parseMark = (input: { state?: unknown; focus?: unknown; resume?: unknown }): Mark | null => {
@@ -95,6 +99,19 @@ export const resumePrompt = (focus: string) =>
 /** The first summary line, so the user and the model can tell a plugin compaction from a typed /compact: both are recorded as `manual`. */
 export const summaryLabel = (current: Mark | null, tokens: number) =>
   `Start the summary with this line: "Compacted by the compact-timing plugin at ${thousands(tokens)} tokens, ${current?.state === 'boundary' ? 'at a `boundary` mark' : 'at the soft limit with no mark'}."`
+
+/**
+ * The arguments of the plugin's `/compact`: the label and the focus. The compaction hook adds the standing
+ * instructions to every compaction, this one too.
+ */
+export const pluginCompactArgs = (current: Mark | null, tokens: number) =>
+  [summaryLabel(current, tokens), current?.focus ?? ''].filter(Boolean).join('\n\n')
+
+/** Why the plugin's own `/compact` did not stand, or null when it did. */
+export const ownCompactFailure = (outcome: OwnCompact): string | null => {
+  if (outcome === null || outcome === 'pending') return 'the compaction did not run'
+  return outcome.skip === null ? null : `compaction skipped (${outcome.skip})`
+}
 
 /** A `git commit`, also after global options such as `-C <dir>`, `-c <key=value>` or `--no-pager`. */
 export const isCommit = (command: string) =>
@@ -186,6 +203,12 @@ export const limitOption = (value: unknown, fallback: number): number => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
+/** A failure the user should see: a toast in the terminal, and a transcript line, which an SDK host such as T3 Code shows too. */
+const report = ($: { ui: { toast: (text: string) => void; log: (text: string) => void } }, text: string) => {
+  $.ui.toast(text)
+  $.ui.log(text)
+}
+
 export const register: Register = (on, options) => {
   const limits: Limits = {
     boundaryTokens: limitOption(options.boundaryTokens, 200_000),
@@ -251,25 +274,38 @@ export const register: Register = (on, options) => {
       if (!decision.compact || tokens === undefined) return result
       const focus = current?.focus ?? ''
       $.ui.toast(`compact-timing: compacting at ${thousands(tokens)} tokens${decision.resume ? ', then resuming' : ''}`)
-      const instructions = [summaryLabel(current, tokens), focus].filter(Boolean).join('\n\n')
-      const outcome = await $.session.compact({ instructions: compactInstructions('plugin', instructions, current) })
-      if ('skip' in outcome && outcome.skip !== undefined) {
-        $.ui.toast(`compact-timing: compaction skipped (${outcome.skip})`)
+      // `/compact` rather than `$.session.compact()`, which rejects in a headless or SDK session (T3 Code, `-p`).
+      // The command runs once the session is idle and resolves after the compaction, in the terminal and the SDK alike.
+      // The command.run hook below marks this run `pending`, and the compaction hook stores its outcome.
+      await update($, ownCompact, (): OwnCompact => null)
+      let outcome: OwnCompact = null
+      try {
+        await $.command.run({ command: 'compact', args: pluginCompactArgs(current, tokens) })
+      } finally {
+        // Its own failure must not hide the command's.
+        await update($, ownCompact, previous => {
+          outcome = previous
+          return null
+        }).catch(() => undefined)
+      }
+      const failure = ownCompactFailure(outcome)
+      if (failure !== null) {
+        report($, `compact-timing: ${failure}`)
         return result
       }
       if (!decision.resume) return result
       let count = 0
       await update($, resumes, previous => (count = previous + 1))
       if (count > maxResumes) {
-        $.ui.toast(`compact-timing: stopped after ${maxResumes} automatic resumes in a row; type "continue" to go on`)
+        report($, `compact-timing: stopped after ${maxResumes} automatic resumes in a row; type "continue" to go on`)
         return result
       }
       // Not awaited: a plugin's prompt runs once the session is idle, which is after this hook returns.
       void $.prompt.submit({ text: resumePrompt(focus) }).catch(error =>
-        $.ui.toast(`compact-timing: resume prompt failed (${error instanceof Error ? error.message : String(error)})`),
+        report($, `compact-timing: resume prompt failed (${error instanceof Error ? error.message : String(error)})`),
       )
     } catch (error) {
-      $.ui.toast(`compact-timing: end of turn failed (${error instanceof Error ? error.message : String(error)})`)
+      report($, `compact-timing: end of turn failed (${error instanceof Error ? error.message : String(error)})`)
     }
     return result
   })
@@ -295,13 +331,23 @@ export const register: Register = (on, options) => {
     return next({ ...e, context: [...(e.context ?? []), contextNote(tokens, markTool)] })
   })
 
+  // Only the plugin's own `/compact` is marked, while it runs, so a `/compact` the user queued is not taken for it.
+  on('command.run', async ($, e, next) => {
+    if (e.command === 'compact' && e.origin.kind === 'plugin' && e.origin.name === 'compact-timing')
+      await update($, ownCompact, (): OwnCompact => 'pending')
+    return next(e)
+  })
+
   on('session.compact', async ($, e, next) => {
-    // The plugin's own compaction already carries its instructions.
+    // Another plugin's direct compaction carries its own instructions. This plugin's runs as `/compact` (`manual`).
     if (e.agentId === undefined && e.trigger !== 'plugin') {
       const current = await read($, mark).catch(() => null)
       e = { ...e, instructions: compactInstructions(e.trigger, e.instructions, current) }
     }
     const result = await next(e)
+    if (e.agentId === undefined && e.trigger === 'manual') {
+      await update($, ownCompact, previous => (previous === 'pending' ? { skip: result.skip ?? null } : previous)).catch(() => undefined)
+    }
     // A compaction that replaces the conversation, also the automatic one at the hard limit, clears the mark.
     // A precompute installs nothing, so the mark stays.
     if (e.agentId === undefined && e.trigger !== 'precompute' && result.skip === undefined) {
