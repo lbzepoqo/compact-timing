@@ -1,7 +1,11 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { PluginState, Register, SessionCompactResult, SessionMessage } from 'claude-code'
 
-export type Mark = { state: 'busy' | 'boundary'; focus: string; resume?: boolean }
+// The stored shapes are declared once, in types/index.d.ts.
+type State = PluginState['compact-timing']
+
+// `userSteps` is set only in pointer mode, where no summarizer lists the user's open steps.
+export type Mark = { state: 'busy' | 'boundary'; focus: string; resume?: boolean; userSteps?: string }
 
 // The last mark the model set in this session. Values are held per session, so sessions do not see
 // each other's marks.
@@ -15,14 +19,27 @@ const resumes = atom({ plugin: 'compact-timing', key: 'resumes' } as const, 0)
 const maxResumes = 10
 // The plugin's own `/compact` while it runs: `pending` until the compaction hook sees it, then its outcome. Its trigger
 // is `manual`, the same as a typed `/compact`, and the command's result says nothing about a skip.
-export type OwnCompact = 'pending' | { skip: string | null } | null
+// `isPointer` when pointer mode answered in place of the summarizer.
+export type OwnCompact = State['ownCompact']
 const ownCompact = atom({ plugin: 'compact-timing', key: 'ownCompact' } as const, null as OwnCompact)
+// Pointer mode: what replaces the conversation at a `boundary` mark, stored before the plugin's `/compact` runs, since
+// the mark is dropped at the end of the turn, before the compaction hook runs.
+export type PointerParts = NonNullable<State['pointer']>
+const pointer = atom({ plugin: 'compact-timing', key: 'pointer' } as const, null as PointerParts | null)
+// Only classic hook events carry the transcript path; pointer mode records it from SessionStart and UserPromptSubmit.
+const transcriptPath = atom({ plugin: 'compact-timing', key: 'transcriptPath' } as const, '')
 
 /** The tool input as the model sends it, or null when the state is not one of the two. */
-export const parseMark = (input: { state?: unknown; focus?: unknown; resume?: unknown }): Mark | null => {
+export const parseMark = (input: { state?: unknown; focus?: unknown; resume?: unknown; userSteps?: unknown }): Mark | null => {
   const state = typeof input.state === 'string' ? input.state.trim().toLowerCase() : ''
   if (state !== 'busy' && state !== 'boundary') return null
-  return { state, focus: typeof input.focus === 'string' ? input.focus.trim() : '', resume: state === 'boundary' && input.resume === true }
+  const userSteps = state === 'boundary' && typeof input.userSteps === 'string' ? input.userSteps.trim() : ''
+  return {
+    state,
+    focus: typeof input.focus === 'string' ? input.focus.trim() : '',
+    resume: state === 'boundary' && input.resume === true,
+    ...(userSteps ? { userSteps } : {}),
+  }
 }
 
 export type Limits = { boundaryTokens: number; softTokens: number }
@@ -38,26 +55,37 @@ export const shouldCompact = (current: Mark | null, tokens: number | undefined, 
 
 const thousands = (tokens: number) => `${Math.round(tokens / 1000)}k`
 
-/** The tool description: what the model reads about the marks. */
-export const ruleText = (limits: Limits) =>
+const pointerFocus =
+  'what the next context must keep. At a `boundary` the plugin replaces the conversation with your focus, `userSteps`, your last message, the transcript path and the commits since the session started; no summary is made. Write it as a handoff: the goal, what is done, the next step, open decisions, file paths. Without a focus the plugin makes a summary instead.'
+const pointerUserSteps =
+  'with `boundary`: every step, command or question you gave the user that they have not yet reported done or answered: commands exactly, the rest briefly, with what each one is for. Steps in the message that ends the turn need not be listed: the pointer keeps that message.'
+
+/** The tool description: what the model reads about the marks. Pointer mode changes the focus and adds `userSteps`. */
+export const ruleText = (limits: Limits, isPointerMode = false) =>
   [
     'Sets the compaction mark for this conversation. The compact-timing plugin compacts at task boundaries instead of at a fixed token count.',
     `- \`boundary\`: call after a task or milestone whose state is saved outside the conversation (committed, or in a plan or notes file). The plugin compacts at the end of that turn when the context contains ${thousands(limits.boundaryTokens)} tokens or more. Either way the mark is dropped when the turn ends.`,
     '- `busy`: call before a step whose details exist only in the conversation, such as a debugging sequence or reading test output. The plugin does not compact while the mark is `busy`. Call with `boundary` when the step is done.',
-    '- `focus`: what the summary must keep: the next step, open decisions, file paths.',
+    isPointerMode ? `- \`focus\`: ${pointerFocus}` : '- `focus`: what the summary must keep: the next step, open decisions, file paths.',
+    ...(isPointerMode ? [`- \`userSteps\`: ${pointerUserSteps}`] : []),
     '- `resume`: set it with `boundary` when steps of the current request remain. Then end the turn: the plugin compacts and sends the focus back as a prompt, so the work continues. The plugin can compact only between turns, so a long turn otherwise keeps growing.',
     `Without a mark the plugin compacts at ${thousands(limits.softTokens)} tokens. Any compaction clears the mark.`,
   ].join('\n')
 
-const markSchema = {
+/** The tool's input schema; `userSteps` only in pointer mode. */
+export const markSchema = (isPointerMode = false) => ({
   type: 'object',
   properties: {
     state: { type: 'string', enum: ['boundary', 'busy'] },
-    focus: { type: 'string', description: 'What the summary must keep: the next step, open decisions, file paths.' },
+    focus: {
+      type: 'string',
+      description: isPointerMode ? `What the next context must keep: ${pointerFocus.replace(/^what the next context must keep\. /, '')}` : 'What the summary must keep: the next step, open decisions, file paths.',
+    },
+    ...(isPointerMode ? { userSteps: { type: 'string', description: `Pointer mode, ${pointerUserSteps}` } } : {}),
     resume: { type: 'boolean', description: 'With `boundary`: steps of the current request remain; end the turn and the plugin compacts and sends the focus back.' },
   },
   required: ['state'],
-}
+})
 
 /** The mark tool's answer: with `resume` it says whether to end the turn now, since that depends on the size. */
 export const markResult = (current: Mark, tokens: number | undefined, limits: Limits): string => {
@@ -89,12 +117,18 @@ export const shouldNudge = (current: Mark | null, tokens: number | undefined, is
  * The prompt sent after a compaction the model asked to resume from. The model may have kept working after it set the
  * mark, so the summary, being newer, decides which steps are done.
  */
-export const resumePrompt = (focus: string) =>
-  [
-    'compact-timing: an automatic prompt from a plugin, not written by the user. The plugin compacted the conversation at the `boundary` mark you set with `resume`.',
-    `Continue the user's request from where you stopped${focus ? `: ${focus}` : '.'}`,
-    'The summary is newer than this focus: skip any step it shows done, and check before repeating a commit, push or deploy.',
-  ].join('\n')
+export const resumePrompt = (focus: string, isPointer = false) =>
+  isPointer
+    ? [
+        'compact-timing: an automatic prompt from a plugin, not written by the user. The plugin replaced the conversation with a pointer at the `boundary` mark you set with `resume`.',
+        "Continue the user's request from the focus in the pointer.",
+        'You may have worked on after you set the mark: before repeating a step, commit, push or deploy, check your last message in the pointer, the commits and `git status`.',
+      ].join('\n')
+    : [
+        'compact-timing: an automatic prompt from a plugin, not written by the user. The plugin compacted the conversation at the `boundary` mark you set with `resume`.',
+        `Continue the user's request from where you stopped${focus ? `: ${focus}` : '.'}`,
+        'The summary is newer than this focus: skip any step it shows done, and check before repeating a commit, push or deploy.',
+      ].join('\n')
 
 /** The first summary line, so the user and the model can tell a plugin compaction from a typed /compact: both are recorded as `manual`. */
 export const summaryLabel = (current: Mark | null, tokens: number) =>
@@ -163,8 +197,54 @@ export const openUserSteps =
  * record per line, so reading it whole refills the context the compaction freed. `command` skips a shell function
  * named grep (such as one calling ugrep, which rejects this window as too complex).
  */
-export const transcriptSearch =
-  "End the summary with this line: \"For exact details the summary dropped (error text, paths, numbers), search the full transcript with command grep -oE '.{0,200}<term>.{0,200}' rather than reading it whole: each line is one long JSON record.\""
+export const transcriptSearchHow =
+  "search the full transcript with command grep -oE '.{0,200}<term>.{0,200}' rather than reading it whole: each line is one long JSON record."
+export const transcriptSearch = `End the summary with this line: "For exact details the summary dropped (error text, paths, numbers), ${transcriptSearchHow}"`
+
+const maxCommitLines = 40
+const maxLastReply = 3000
+
+/** The `git log` part of the pointer: the commits, none, or why git gave none. Never throws, so a failed git keeps the pointer. */
+export const commitsText = (
+  run: { exitCode: number; stdout: string; stderr: string } | { error: string },
+  directory: string,
+  since: string,
+): string => {
+  const where = `in ${directory} since ${since}`
+  if ('error' in run) return `git log failed ${where} (${run.error}). If the work is in a repository elsewhere, run git log there.`
+  if (run.exitCode !== 0) {
+    const reason = run.stderr.trim().split('\n')[0] || `exit code ${run.exitCode}`
+    return `git log failed ${where} (${reason}). If the work is in a repository elsewhere, run git log there.`
+  }
+  const lines = run.stdout.split('\n').filter(line => line.trim() !== '')
+  if (lines.length === 0) return `None ${where}.`
+  const shown = lines.slice(0, maxCommitLines)
+  const more = lines.length > shown.length ? [`... and ${lines.length - shown.length} older`] : []
+  return [`${lines.length} ${where}, newest first:`, ...shown, ...more].join('\n')
+}
+
+/**
+ * The model's last message with text: the mark is set inside a turn, so steps given to the user in the turn's closing
+ * message come after it. The end is kept, since a closing message ends with what it asks.
+ */
+export const lastReply = (messages: readonly Pick<SessionMessage, 'role' | 'text'>[]): string => {
+  const last = [...messages].reverse().find(message => message.role === 'assistant' && message.text.trim() !== '')
+  if (!last) return ''
+  const text = last.text.trim()
+  return text.length > maxLastReply ? `...${text.slice(-maxLastReply)}` : text
+}
+
+/** The one user message that replaces the conversation in pointer mode. Its first line labels it, as summaryLabel does a summary. */
+export const pointerText = (parts: PointerParts, reply: string) =>
+  [
+    `Compacted by the compact-timing plugin at ${thousands(parts.tokens)} tokens, at a \`boundary\` mark, in pointer mode: this message replaced the conversation, and no summary was made.`,
+    'compact-timing: an automatic message from a plugin, not written by the user. You wrote the focus, the open steps and the last message; the plugin added the transcript path and the commits.',
+    `## Focus\n${parts.focus || 'None given.'}`,
+    `## Open steps you gave the user\n${parts.userSteps || 'None listed.'}`,
+    `## Your last message\n${reply || 'None found.'}`,
+    `## Transcript\n${parts.transcriptPath}\nFor anything else from the conversation (what the user asked, error text, paths, numbers), ${transcriptSearchHow} Search it before asking the user for something they may already have given.`,
+    `## Commits\n${parts.commits}`,
+  ].join('\n\n')
 
 /**
  * Instructions for every compaction of the main conversation: the ones given, or the mark's focus for a compaction
@@ -216,17 +296,40 @@ export const register: Register = (on, options) => {
   }
   let markTool = 'mcp__compact-timing__mark'
   const isContextNoteOn = options.contextNote !== false
+  // Also the string, as `--values-stdin` takes values (see the README's example).
+  const isPointerMode = options.pointerMode === true || options.pointerMode === 'true'
 
   on('session.start', async ($, e, next) => {
-    const registered = await $.tool.register({ name: 'mark', description: ruleText(limits), inputSchema: markSchema, isDeferred: false })
+    const registered = await $.tool.register({
+      name: 'mark',
+      description: ruleText(limits, isPointerMode),
+      inputSchema: markSchema(isPointerMode),
+      isDeferred: false,
+    })
     markTool = registered.tool
     return next(e)
   })
 
+  if (isPointerMode) {
+    // Recorded on both: `/clear` starts a new transcript, and a plugin enabled mid-session first sees a prompt. Written
+    // only when it changed, so a prompt costs a read.
+    on('classic.SessionStart', async ($, e, next) => {
+      if (e.agent_id === undefined && e.transcript_path && (await read($, transcriptPath).catch(() => '')) !== e.transcript_path)
+        await update($, transcriptPath, () => e.transcript_path).catch(() => undefined)
+      return next(e)
+    })
+    on('classic.UserPromptSubmit', async ($, e, next) => {
+      if (e.agent_id === undefined && e.transcript_path && (await read($, transcriptPath).catch(() => '')) !== e.transcript_path)
+        await update($, transcriptPath, () => e.transcript_path).catch(() => undefined)
+      return next(e)
+    })
+  }
+
   on('tool.call', async ($, e, next) => {
     if (e.tool === markTool) {
       if (e.agentId !== undefined) return { result: 'Only the main conversation sets the compaction mark.' }
-      const parsed = parseMark(e as unknown as { state?: unknown; focus?: unknown; resume?: unknown })
+      const input = e as unknown as { state?: unknown; focus?: unknown; resume?: unknown; userSteps?: unknown }
+      const parsed = parseMark(isPointerMode ? input : { ...input, userSteps: undefined })
       if (!parsed) return { result: 'The mark was not set: state must be `boundary` or `busy`.' }
       const tokens = parsed.resume ? await $.session.usage().then(usage => usage.context.tokens).catch(() => undefined) : undefined
       const stored = armedMark(parsed, tokens, limits)
@@ -262,7 +365,8 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     if (e.agentId !== undefined) return result
     try {
-      const tokens = await $.session.usage().then(usage => usage.context.tokens)
+      const usage = await $.session.usage()
+      const tokens = usage.context.tokens
       let current = null as Mark | null
       let decision = { next: null as Mark | null, compact: false, resume: false }
       // One read-modify-write, so a mark set meanwhile is neither lost nor judged by the old value.
@@ -278,6 +382,33 @@ export const register: Register = (on, options) => {
       // The command runs once the session is idle and resolves after the compaction, in the terminal and the SDK alike.
       // The command.run hook below marks this run `pending`, and the compaction hook stores its outcome.
       await update($, ownCompact, (): OwnCompact => null)
+      // Pointer mode at a boundary: the compaction hook answers with these parts in place of the summarizer. Without
+      // them (no mode, no mark, no focus, no transcript path, a failure here) the same `/compact` makes a summary.
+      // `current` is assigned inside the callback above, which TypeScript does not follow.
+      const marked = current as Mark | null
+      let parts: PointerParts | null = null
+      if (isPointerMode && marked?.state === 'boundary') {
+        try {
+          const path = await read($, transcriptPath)
+          if (!path) {
+            $.ui.log('compact-timing: pointer mode has no transcript path for this session, so this compaction makes a summary')
+          } else if (!marked.focus) {
+            // Without a focus the pointer would hold no goal and no next step: the summary keeps more.
+            $.ui.log('compact-timing: the boundary mark has no focus, so this compaction makes a summary instead of a pointer')
+          } else {
+            const directory = await $.session.cwd()
+            const since = new Date(usage.startedAt).toISOString()
+            // The author tells the model's own commits from ones a pull brought in.
+            const run = await $.process
+              .run(['git', 'log', `--since=${since}`, '--format=%h %ad %an: %s', '--date=format:%Y-%m-%d %H:%M'], { cwd: directory, timeoutMs: 10_000 })
+              .catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) }))
+            parts = { tokens, focus: marked.focus, userSteps: marked.userSteps ?? '', transcriptPath: path, commits: commitsText(run, directory, since) }
+          }
+        } catch (error) {
+          report($, `compact-timing: pointer failed, making a summary (${error instanceof Error ? error.message : String(error)})`)
+        }
+      }
+      if (isPointerMode) await update($, pointer, () => parts)
       let outcome: OwnCompact = null
       try {
         await $.command.run({ command: 'compact', args: pluginCompactArgs(current, tokens) })
@@ -287,12 +418,16 @@ export const register: Register = (on, options) => {
           outcome = previous
           return null
         }).catch(() => undefined)
+        if (isPointerMode) await update($, pointer, () => null).catch(() => undefined)
       }
       const failure = ownCompactFailure(outcome)
       if (failure !== null) {
         report($, `compact-timing: ${failure}`)
         return result
       }
+      const settled = outcome as OwnCompact
+      const isPointer = typeof settled === 'object' && settled?.isPointer === true
+      if (parts !== null && !isPointer) $.ui.log('compact-timing: pointer mode fell back to a summary for this compaction')
       if (!decision.resume) return result
       let count = 0
       await update($, resumes, previous => (count = previous + 1))
@@ -301,7 +436,7 @@ export const register: Register = (on, options) => {
         return result
       }
       // Not awaited: a plugin's prompt runs once the session is idle, which is after this hook returns.
-      void $.prompt.submit({ text: resumePrompt(focus) }).catch(error =>
+      void $.prompt.submit({ text: resumePrompt(focus, isPointer) }).catch(error =>
         report($, `compact-timing: resume prompt failed (${error instanceof Error ? error.message : String(error)})`),
       )
     } catch (error) {
@@ -339,14 +474,24 @@ export const register: Register = (on, options) => {
   })
 
   on('session.compact', async ($, e, next) => {
+    // Pointer mode answers only the plugin's own `/compact` at a boundary: `pending` and the parts stored for it. Every
+    // other compaction (a typed `/compact`, Claude Code's own, a subagent's) goes on to the summarizer.
+    let pointed: SessionCompactResult | null = null
+    if (isPointerMode && e.agentId === undefined && e.trigger === 'manual') {
+      const [own, parts] = await Promise.all([read($, ownCompact).catch(() => null), read($, pointer).catch(() => null)])
+      if (own === 'pending' && parts) pointed = { messages: [{ role: 'user', text: pointerText(parts, lastReply(e.messages)), toolUses: [] }] }
+    }
     // Another plugin's direct compaction carries its own instructions. This plugin's runs as `/compact` (`manual`).
-    if (e.agentId === undefined && e.trigger !== 'plugin') {
+    if (pointed === null && e.agentId === undefined && e.trigger !== 'plugin') {
       const current = await read($, mark).catch(() => null)
       e = { ...e, instructions: compactInstructions(e.trigger, e.instructions, current) }
     }
-    const result = await next(e)
+    const result = pointed ?? (await next(e))
     if (e.agentId === undefined && e.trigger === 'manual') {
-      await update($, ownCompact, previous => (previous === 'pending' ? { skip: result.skip ?? null } : previous)).catch(() => undefined)
+      const isPointer = pointed !== null
+      await update($, ownCompact, previous => (previous === 'pending' ? { skip: result.skip ?? null, ...(isPointer ? { isPointer } : {}) } : previous)).catch(
+        () => undefined,
+      )
     }
     // A compaction that replaces the conversation, also the automatic one at the hard limit, clears the mark.
     // A precompute installs nothing, so the mark stays.

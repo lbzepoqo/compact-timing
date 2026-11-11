@@ -1,6 +1,6 @@
 {
   "name": "compact-timing",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Compacts the conversation at task boundaries instead of at a fixed token count: the model marks the session busy or at a boundary, and the plugin compacts at the end of a turn when the mark and the context size allow it",
   "author": {
     "name": "lbzepoqo",
@@ -27,6 +27,12 @@
       "title": "Context note",
       "description": "Once the context reaches boundaryTokens, tell the model to suggest /clear or a handoff when a request starts unrelated work, and to set the boundary mark at the next break when it continues the work",
       "default": true
+    },
+    "pointerMode": {
+      "type": "boolean",
+      "title": "Pointer mode",
+      "description": "At a boundary mark, replace the conversation with one message (the mark focus, the open user steps, the last reply, the transcript path and the commits since the session started) instead of a summary. Other compactions keep the summary",
+      "default": false
     }
   }
 }

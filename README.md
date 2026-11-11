@@ -40,7 +40,25 @@ A `busy` mark that is never replaced stops the plugin from compacting. Claude Co
 
 Claude Code also compacts on its own: at `autoCompactWindow`, on a prompt that is too long, and while the session is idle before the prompt cache expires. These compactions do not wait for the mark. When one has no instructions of its own, the plugin passes the mark's focus as the instructions. The same holds for the precompute Claude Code runs while the session is idle. So the summary still keeps what a `busy` step needs.
 
-Every compaction of the main conversation gets one more request, also a `/compact` you type. It asks the summary to keep each step, command or question the model gave the user that the user has not yet reported done or answered. Commands stay exact and the rest stays short. Claude Code's summary already lists the model's own pending tasks, but not the user's. In one session the summary dropped a four-step test the model had asked the user to run shortly before the compaction, and the model then said it had never asked for it.
+Every compaction of the main conversation gets one more request, also a `/compact` you type. It asks the summary to keep each step, command or question the model gave the user that the user has not yet reported done or answered. Commands stay exact and the rest stays short. Claude Code's summary already lists the model's own pending tasks, but not the user's. In one session the summary dropped a four-step test the model had asked the user to run shortly before the compaction, and the model then said it had never asked for it. Pointer mode makes no summary at a `boundary`, so there the model lists these steps itself (see below).
+
+### Pointer mode
+
+With `pointerMode` on, the plugin's compaction at a `boundary` mark makes no summary. The plugin replaces the conversation with one message, which holds:
+
+- the mark's focus, which the model is asked to write as a handoff: the goal, what is done, the next step, open decisions, file paths;
+- the open steps the model gave the user, which it lists in the mark's `userSteps` input;
+- the model's last message, capped at 3,000 characters. The model sets the mark inside a turn, so steps it gives the user in the message that ends the turn come after the mark;
+- the path of the session's transcript, with the same search line a summary ends with;
+- `git log` since the session started, in the session's directory, at most 40 commits, each with its author, so commits a pull brought in can be told apart. If git fails there, the message says why.
+
+The message starts with "Compacted by the compact-timing plugin at 214k tokens, at a `boundary` mark, in pointer mode". A resume after it tells the model to continue from the focus and to check its last message, the commits and `git status` before it repeats a step.
+
+The model lists the open user steps itself because no summarizer runs. The transcript still holds them, but a model that does not know it gave a step does not search for it. That is the failure described above.
+
+All other compactions keep the summary: the plugin's compaction with no mark at `softTokens`, a `/compact` you type, Claude Code's own (`autoCompactWindow`, a prompt that is too long, idle, precompute), and a subagent's. If the plugin does not know the transcript path, or the mark has no focus, it makes a summary and says so in a transcript line. It learns the path from Claude Code's SessionStart and UserPromptSubmit events, the only events that carry it.
+
+The plugin answers the pointer compaction itself, so another plugin's compaction hook that would run after compact-timing's does not run for it.
 
 ## Install
 
@@ -58,6 +76,7 @@ Restart Claude Code. The `lbzepoqo/claude-plugins` marketplace also lists it, as
 | `boundaryTokens` | 200000 | Context size at which a `boundary` mark causes compaction |
 | `softTokens` | 300000 | Context size at which the plugin compacts when there is no mark |
 | `contextNote` | true | Send the note about a fresh session when the context reaches `boundaryTokens` |
+| `pointerMode` | false | At a `boundary` mark, replace the conversation with a pointer instead of a summary (see Pointer mode) |
 
 Change them with `/plugin configure compact-timing@compact-timing` in Claude Code, or from the shell:
 
@@ -74,6 +93,7 @@ In three weeks of my own sessions (`boundaryTokens` 120k, `softTokens` 200k), Cl
 - In a test, Opus, Sonnet and Haiku each set `boundary` with a useful focus after they committed a bug fix. None of them set `busy` while it searched for the bug. Without the commit reminder, Opus set no mark at all.
 - In a test of a manual `/compact` on a short session, the summaries of Opus, Sonnet and Haiku each ended with the transcript search line.
 - Before 0.9.1, the plugin never compacted in a headless or SDK session (T3 Code, `claude -p`), and the only sign was a toast that SDK hosts do not show. The `/compact` path was tested in both an SDK session and the terminal.
+- Pointer mode was tested in one headless stream-json session (the SDK's transport) with Haiku. The pointer replaced the conversation, and no summary request was made: 28k tokens became 0.4k in 5 ms. It has not been compared with summaries in daily use yet.
 
 ## Develop
 
