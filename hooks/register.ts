@@ -210,7 +210,7 @@ const commitEntry = /^commit(?: \([a-z-]+\))?: /
  * that says so, is found, and a commit a hook rejected is not. A commit followed by a checkout in the same command
  * still counts. Git keeps whole seconds, so a commit made earlier in the second the call started counts too. An entry
  * dated after the read (a commit date set ahead, a clock running fast) is not from this call. A failed read concludes
- * nothing. With `command`, the commit's subject must also be in the command's text (`isSubjectIn`).
+ * nothing. With `command`, the commit's subject must also be one the command gives (`commitSubjects`).
  */
 export const isCommitLogged = (
   run: { exitCode: number; stdout: string } | { error: string },
@@ -221,26 +221,64 @@ export const isCommitLogged = (
   if ('error' in run || run.exitCode !== 0) return false
   const since = Math.floor(startedAt / 1000)
   const until = Math.floor(endedAt / 1000)
+  const given = command === undefined ? undefined : new Set(commitSubjects(command).map(words))
   return run.stdout.split('\n').some(line => {
     const entry = reflogEntry.exec(line.trimEnd())
     const time = Number(entry?.[1])
     const subject = entry?.[2]
     if (subject === undefined || time < since || time > until || !commitEntry.test(subject)) return false
-    return command === undefined || isSubjectIn(subject.replace(commitEntry, ''), command)
+    if (given === undefined) return true
+    const logged = words(subject.replace(commitEntry, ''))
+    return logged !== '' && given.has(logged)
   })
 }
 
-// Letters and digits only, each run of anything else one space, so quoting and escaping do not count.
-const words = (text: string) => ` ${text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()} `
+// Letters and digits only, each run of anything else one space, so quoting, escaping and case do not count.
+const words = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+
+// What git logs as the subject: the first line that is not blank, trimmed.
+const firstLine = (text: string) => text.split(/\r?\n/).map(line => line.trim()).find(line => line !== '') ?? ''
+
+const commitGlobal = new RegExp(commitCommand, 'g')
+// The first message after `-m` or `--message` (with `=`, a space, or a quote right after it): in double quotes (with
+// `\"` or PowerShell's `""` inside), in escaped double quotes inside a `bash -c "..."`, a PowerShell here-string, ANSI-C
+// quotes, single quotes (with PowerShell's `''` inside), or one word.
+const messageOption =
+  /(?:^|\s)(?:-[a-zA-Z]*m|--message)(?:=|\s+|(?=["'$@\\]))(?:"((?:[^"\\]|\\.|"")*)"|\\+"([\s\S]*?)\\+"|@["']\r?\n([\s\S]*?)\r?\n\s*["']@|\$'((?:[^'\\]|\\.)*)'|'((?:[^']|'')*)'|([^\s;&|)]+))/
+// A message read from standard input, which a heredoc then gives: `-F -`, `-F-`, `--file=-`, `--file -`.
+const messageFromInput = /(?:^|\s)(?:-[a-zA-Z]*F\s*-|--file(?:=|\s+)-)(?=\s|$)/
+const heredocStart = /(?<!<)<<-?(?!<)\s*\\?["']?\w+/
+
+/** The first line that is not blank in the heredoc that `text` opens first, or '' without one. */
+const heredocSubject = (text: string) => {
+  const start = text.search(heredocStart)
+  const bodyStart = start === -1 ? -1 : text.indexOf('\n', start)
+  return bodyStart === -1 ? '' : firstLine(text.slice(bodyStart + 1))
+}
 
 /**
- * Whether a commit's subject is in a command's text, word for word: a commit in another worktree is this command's
- * only when its message came from the command (`-m`, or a heredoc for `-F -`). A commit another session made there at
- * the same moment has its own subject. A message read from a file, and `--amend --no-edit`, are not in the command.
+ * The subjects of the messages a command gives its commits, one for each `git commit` with one: what the subject of a
+ * commit it made in another worktree is compared with, word for word, so a commit another session made there at the
+ * same moment, with its own subject, is not taken for this command's. The message is the first `-m` after the commit,
+ * or a heredoc after `-F -`; a `-m "$(cat <<'EOF' ...)"` gives the heredoc's. Not given are a message from a file
+ * (`-F msg.txt`), `--amend --no-edit`, `-C <commit>`, `--fixup`, a `<<<` string, and a bash `'\''` inside quotes;
+ * a message with a shell variable or `$(...)` in its first line never matches what git logged.
  */
-const isSubjectIn = (subject: string, command: string) => {
-  const subjectWords = words(subject)
-  return subjectWords.trim() !== '' && words(command).includes(subjectWords)
+export const commitSubjects = (command: string): string[] => {
+  const commits = [...command.matchAll(commitGlobal)]
+  const subjects = commits.map((commit, index) => {
+    const after = command.slice((commit.index ?? 0) + commit[0].length, commits[index + 1]?.index ?? command.length)
+    const option = messageOption.exec(after)
+    if (option) {
+      const [, doubled, escaped, hereString, ansi, single, word] = option
+      if (ansi !== undefined) return firstLine(ansi.replace(/\\n/g, '\n'))
+      const message = doubled ?? escaped ?? hereString ?? single ?? word ?? ''
+      return heredocStart.test(firstLine(message)) ? heredocSubject(message) : firstLine(message)
+    }
+    const input = messageFromInput.exec(after)
+    return input ? heredocSubject(after.slice(input.index)) : ''
+  })
+  return subjects.filter(subject => subject !== '')
 }
 
 /** The worktrees of the session folder's repository, one `worktree <path>` line each, the session folder's own too. */
@@ -275,7 +313,10 @@ const pathSpellings = (path: string, home: string | undefined): string[] => {
   const spellings = [path]
   const drive = drivePath.exec(path)
   if (drive) spellings.push(`/${drive[1]?.toLowerCase()}/${drive[2]}`, `/mnt/${drive[1]?.toLowerCase()}/${drive[2]}`)
-  const homeFolder = home ? withSlashes(home) : ''
+  // A home folder as Git Bash or WSL writes it (`/c/Users/ada`), where git writes the worktree's path `C:/...`.
+  const homeFolder = (home ? withSlashes(home) : '').replace(/^\/(?:mnt\/|cygdrive\/)?([a-zA-Z])(?=\/|$)/, (spelled, letter: string) =>
+    drive ? `${letter.toUpperCase()}:` : spelled,
+  )
   if (homeFolder !== '' && homeFolder !== '/' && path.length > homeFolder.length && isInside(path, homeFolder)) {
     const rest = path.slice(homeFolder.length + 1)
     spellings.push(`~/${rest}`, `$HOME/${rest}`, `\${HOME}/${rest}`)
@@ -524,6 +565,36 @@ const runGit = async (
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) }
   }
+}
+
+/**
+ * Whether a commit command made a commit, by HEAD's reflog in the session folder or, when that answered and shows
+ * none, in another worktree of its repository that the command names (`namedWorktrees`), where the commit's subject
+ * must also be one the command gives (`commitSubjects`): a command can name a path it only reads in. The end of the
+ * window is taken before those reads, so a commit made while they run is not this command's.
+ */
+const isCommitFound = async (
+  $: Parameters<typeof runGit>[0] & {
+    session: { cwd: () => Promise<string> }
+    env: { get: (name: string) => Promise<string | undefined> }
+  },
+  command: string,
+  startedAt: number,
+): Promise<boolean> => {
+  const own = await runGit($, reflogArguments, { timeoutMs: reflogTimeout })
+  const endedAt = Date.now()
+  if (isCommitLogged(own, startedAt, endedAt)) return true
+  if (!isGitAnswer(own) || !mayNamePath(command)) return false
+  const [list, cwd, home] = await Promise.all([
+    runGit($, worktreeListArguments, { timeoutMs: reflogTimeout }),
+    $.session.cwd().catch(() => ''),
+    // An empty HOME is unset too.
+    $.env.get('HOME').then(async value => value || (await $.env.get('USERPROFILE'))).catch(() => undefined),
+  ])
+  if (!('exitCode' in list) || list.exitCode !== 0) return false
+  const named = namedWorktrees(command, worktreePaths(list.stdout), cwd, home)
+  const runs = await Promise.all(named.map(folder => runGit($, reflogArguments, { cwd: folder, timeoutMs: reflogTimeout })))
+  return runs.some(run => isCommitLogged(run, startedAt, endedAt, command))
 }
 
 /**
@@ -829,28 +900,6 @@ export const register: Register = (on, options) => {
   }
 
   on('tool.call', async ($, e, next) => {
-    /**
-     * Whether a commit command made a commit, by HEAD's reflog in the session folder or, when that answered and shows
-     * none, in another worktree of its repository that the command names (`namedWorktrees`), where the commit's subject
-     * must also be in the command (`isSubjectIn`): a path can be named by a command that only reads there. The end of
-     * the window is taken before those reads, so a commit made while they run is not this command's.
-     */
-    const isCommitFound = async (command: string, startedAt: number): Promise<boolean> => {
-      const own = await runGit($, reflogArguments, { timeoutMs: reflogTimeout })
-      const endedAt = Date.now()
-      if (isCommitLogged(own, startedAt, endedAt)) return true
-      if (!isGitAnswer(own) || !mayNamePath(command)) return false
-      const [list, cwd, home] = await Promise.all([
-        runGit($, worktreeListArguments, { timeoutMs: reflogTimeout }),
-        $.session.cwd().catch(() => ''),
-        // An empty HOME is unset too.
-        $.env.get('HOME').then(async value => value || (await $.env.get('USERPROFILE'))).catch(() => undefined),
-      ])
-      if (!('exitCode' in list) || list.exitCode !== 0) return false
-      const named = namedWorktrees(command, worktreePaths(list.stdout), cwd, home)
-      const runs = await Promise.all(named.map(folder => runGit($, reflogArguments, { cwd: folder, timeoutMs: reflogTimeout })))
-      return runs.some(run => isCommitLogged(run, startedAt, endedAt, command))
-    }
     if (e.tool === markTool) {
       if (e.agentId !== undefined) return { result: 'Only the main conversation sets the compaction mark.' }
       const input = e as unknown as { state?: unknown; focus?: unknown; resume?: unknown; userSteps?: unknown }
@@ -881,7 +930,7 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined || result.deny !== undefined || result.isError) return result
     // Pointer mode: whether the main agent's commit command made a commit, for the work digest. A call run in the
     // background has only started by now.
-    const isCommitMade = isPointerMode && isCommitCommand && input.run_in_background !== true && (await isCommitFound(String(input.command), startedAt))
+    const isCommitMade = isPointerMode && isCommitCommand && input.run_in_background !== true && (await isCommitFound($, String(input.command), startedAt))
     if (isCommitMade)
       await update($, commitCalls, previous => [...(Array.isArray(previous) ? previous : []), e.tool_use_id].slice(-maxCommitCalls)).catch(() => undefined)
     if (isPointerMode) {

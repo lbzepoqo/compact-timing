@@ -6,6 +6,7 @@ import {
   addFile,
   addRequest,
   afterLastCommit,
+  commitSubjects,
   commitsText,
   compactInstructions,
   emptyRecord,
@@ -846,6 +847,8 @@ test('the worktrees a command names are the ones read for its commit', () => {
   expect(windowsNamed('cd /c/Users/ada/repo-wt/fix && git commit -qm x')).toEqual(['C:/Users/ada/repo-wt/fix'])
   expect(windowsNamed('wsl -e bash -c "cd /mnt/c/Users/ada/repo-wt/fix && git commit -qm x"')).toEqual(['C:/Users/ada/repo-wt/fix'])
   expect(windowsNamed('cd ~/repo-wt/fix && git commit -qm x')).toEqual(['C:/Users/ada/repo-wt/fix'])
+  // A home folder as Git Bash writes it.
+  expect(namedWorktrees('cd ~/repo-wt/fix && git commit -qm x', windows, 'C:/Users/ada/repo', '/c/Users/ada')).toEqual(['C:/Users/ada/repo-wt/fix'])
   expect(windowsNamed('cd C:\\Users\\ada\\repo && git commit -qm x')).toEqual([])
   // Doubled backslashes, as an escaped path has them.
   expect(windowsNamed('git -C "C:\\\\Users\\\\ada\\\\repo-wt\\\\fix" commit -qm x')).toEqual(['C:/Users/ada/repo-wt/fix'])
@@ -855,7 +858,27 @@ test('the worktrees a command names are the ones read for its commit', () => {
   expect(namedWorktrees(command, ['/repo', ...many], '/repo', undefined)).toEqual(['/wt/w5', '/wt/w4', '/wt/w3', '/wt/w2'])
 })
 
-test('a commit in another worktree is this command\'s only when its subject is in the command', () => {
+test('a commit in another worktree is this command\'s only when its subject is the first line of a message the command gives', () => {
+  // The messages a command gives, in each way the models write them.
+  // One for each commit: its first `-m`, as git takes the subject from it.
+  expect(commitSubjects('cd /wt && git commit -qm "Fix the parser" -m "Why."')).toEqual(['Fix the parser'])
+  expect(commitSubjects('git -C /a commit -qm one && git -C /b commit -q -m "two"')).toEqual(['one', 'two'])
+  expect(commitSubjects(`bash -c "cd /wt && git commit -qm 'Fix it'"`)).toEqual(['Fix it'])
+  expect(commitSubjects('wsl -e bash -c "git commit -qm \\"Fix it\\""')).toEqual(['Fix it'])
+  expect(commitSubjects('git commit -q --message=Fix')).toEqual(['Fix'])
+  expect(commitSubjects("git commit -qm $'Fix it\\n\\nWhy.'")).toEqual(['Fix it'])
+  expect(commitSubjects("git commit -qF - <<'EOF'\n\nFix it\n\nWhy.\nEOF")).toEqual(['Fix it'])
+  expect(commitSubjects('git commit -qm "$(cat <<\'EOF\'\nFix it\n\nWhy.\nEOF\n)"')).toEqual(['Fix it'])
+  expect(commitSubjects("git commit -q -m @'\nFix it\n\nWhy.\n'@")).toEqual(['Fix it'])
+  expect(commitSubjects("git commit -q -m 'It''s fixed'")).toEqual(["It''s fixed"])
+  // The first line that is not blank, as git logs it.
+  expect(commitSubjects('git commit -qm "\n\n  Padded subject  "')).toEqual(['Padded subject'])
+  // Not a message: an option of another program or command, a heredoc the commit does not read, a message from a file.
+  expect(commitSubjects('python -m pytest && git stash push -m wip; find . -name x; git -C /wt commit -qm y')).toEqual(['y'])
+  expect(commitSubjects("git commit -q --amend --no-edit && python3 - <<'PY'\nprint(1)\nPY")).toEqual([])
+  expect(commitSubjects('git commit -qF msg.txt && bun test')).toEqual([])
+  expect(commitSubjects("git -C /wt commit -qF - <<< 'Fix it'\necho done")).toEqual([])
+
   const now = Math.floor(Date.now() / 1000)
   const reflog = (subject: string) => ({ exitCode: 0, stdout: `HEAD@{${now}}\t${subject}\n` })
   const logged = (subject: string, command: string) => isCommitLogged(reflog(subject), now * 1000, now * 1000 + 500, command)
@@ -864,10 +887,16 @@ test('a commit in another worktree is this command\'s only when its subject is i
   expect(logged('commit: Fix the "parser"', `bash -c "cd /wt && git commit -qm 'Fix the \\"parser\\"'"`)).toBe(true)
   expect(logged('commit (amend): fix the parser', 'git -C /wt commit -q --amend -m "Fix the parser"')).toBe(true)
   expect(logged('commit: Fix the parser', 'cd /wt && git commit -qF - <<EOF\nFix the parser\n\nWhy.\nEOF')).toBe(true)
-  // Another subject, a part of a word, a message from a file, or an empty subject is not.
+  expect(logged('commit: Update docs/README.md', 'cd /wt && git commit -qm "Update docs/README.md"')).toBe(true)
+  expect(logged("commit: It's fixed", "git -C C:/wt commit -q -m 'It''s fixed'")).toBe(true)
+  // Another subject, a part of the message, words elsewhere in the command, a word of a path, a message from a file,
+  // one with a variable, or an empty subject is not.
   expect(logged('commit: Other session work', 'git commit -qm "Fix the parser"; cat /wt/notes.md')).toBe(false)
-  expect(logged('commit: Fix', 'cd /wt && git commit -qm "Fixes"')).toBe(false)
+  expect(logged('commit: Fix the parser', 'cd /wt && git commit -qm "Fix the parser and lexer"')).toBe(false)
+  expect(logged('commit: test', 'bun test && git -C /wt commit -qm x')).toBe(false)
+  expect(logged('commit: fix', 'git commit -qm x; type C:\\Users\\ada\\repo-wt\\fix\\notes.md')).toBe(false)
   expect(logged('commit: Fix the parser', 'cd /wt && git commit -qF msg.txt')).toBe(false)
+  expect(logged('commit: Release 1.2.3', 'cd /wt && git commit -qm "Release $VERSION"')).toBe(false)
   expect(logged('commit: ...', 'cd /wt && git commit -qm ...')).toBe(false)
   // Without a command, as for the session folder, the subject does not matter.
   expect(isCommitLogged(reflog('commit: Other session work'), now * 1000, now * 1000 + 500)).toBe(true)
