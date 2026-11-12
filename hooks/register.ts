@@ -428,6 +428,15 @@ export const workPart = (messages: readonly WorkMessage[], toolName: string): st
 }
 
 /**
+ * The last shell command after the last commit, in one line, when it failed; else null. A search that matched nothing
+ * fails too, so what a caller says about it is worded as a condition.
+ */
+export const lastFailedShell = (messages: readonly WorkMessage[], toolName: string): string | null => {
+  const lastShell = afterLastCommit(workEntries(messages, toolName)).entries.filter(entry => entry.isShell).at(-1)
+  return lastShell?.isFailedShell ? clipEnd(lastShell.text.split('\n')[0] ?? '', 120) : null
+}
+
+/**
  * What the mark tool adds to its answer in pointer mode, while the model still has the conversation: a pointer is only
  * as good as its focus, and nothing after the compaction can ask for a better one. A second call replaces the mark, so
  * the advice says to repeat the other inputs.
@@ -440,10 +449,10 @@ export const pointerAdvice = (current: Mark, messages: readonly WorkMessage[], t
     advice.push(
       `Pointer mode: the focus is ${current.focus.length} characters, and it is all the next context gets from you about the goal, what is done, the next step, open decisions and what you ruled out. If it leaves one of those out, call again before you end the turn, with a fuller focus and \`resume\` and \`userSteps\` as you gave them: a new call replaces the mark.`,
     )
-  const lastShell = afterLastCommit(workEntries(messages, toolName)).entries.filter(entry => entry.isShell).at(-1)
-  if (lastShell?.isFailedShell)
+  const failed = lastFailedShell(messages, toolName)
+  if (failed !== null)
     advice.push(
-      `Pointer mode: your last shell command failed and nothing was committed after it (${clipEnd(lastShell.text.split('\n')[0] ?? '', 120)}). The pointer keeps a digest of that work, not the full output. If the step is unfinished, call again with \`busy\` and go on with it; if it is finished, make sure the focus says what failed and why it no longer matters.`,
+      `Pointer mode: your last shell command failed and nothing was committed after it (${failed}). The pointer keeps a digest of that work, not the full output. If the step is unfinished, call again with \`busy\` and go on with it; if it is finished, make sure the focus says what failed and why it no longer matters.`,
     )
   return advice
 }
