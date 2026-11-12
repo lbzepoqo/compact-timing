@@ -76,14 +76,18 @@ Each compaction also shows a toast with the size. A compaction that fails or is 
 Off by default. With `pointerMode` on, the plugin's compaction at a `boundary` mark makes no summary. It replaces the conversation with one message that holds:
 
 - the mark's focus, which the model is asked to write as a handoff: goal, what is done, next step, open decisions, file paths;
+- the requests you typed this session, verbatim: the first three and the newest five, each up to 2,000 characters, with a count of the ones between, so your own words are there next to the model's paraphrase in the focus;
 - the open user steps, which the model lists in `userSteps` because no summarizer runs to find them;
 - the model's last message, up to 3,000 characters (steps it gives you after setting the mark are in there);
+- the files the model wrote this session with Write, Edit or NotebookEdit, each once, at most 40 (files changed through Bash are not listed);
 - the transcript path, with the same search line a summary ends with;
 - `git log` since the session started, at most 40 commits with authors, so pulled-in commits stand out. If git fails, the message says why.
 
 The message starts with "Compacted by the compact-timing plugin at 214k tokens, at a `boundary` mark, in pointer mode". A resume after it tells the model to continue from the focus and to check its last message, the commits and `git status` before repeating a step.
 
 Every other compaction still makes a summary: with no mark at `softTokens`, a `/compact` you type, Claude Code's own, and a subagent's. The plugin also falls back to a summary, with a transcript line saying so, when the mark has no focus or the transcript path is unknown. It learns the path from Claude Code's classic SessionStart and UserPromptSubmit events, since the plugin API has no other way to get it.
+
+The requests and files are recorded as the session runs, because the plugin can read at most 4 MiB of a file and a long transcript is larger. They start from when pointer mode is on, so a session that was already running when you turned it on lacks the earlier ones, and a `/clear` empties them. A request is a prompt that counts as yours for the context note too: typed, from Remote Control or from an SDK host such as T3 Code. Slash commands and the plugin's own resume prompts are left out. An SDK host may also send messages from other sessions as prompts, and those are recorded as requests.
 
 The plugin answers the pointer compaction itself, so a compaction hook from another plugin that runs after compact-timing's does not run for it.
 

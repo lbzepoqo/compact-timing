@@ -28,6 +28,11 @@ export type PointerParts = NonNullable<State['pointer']>
 const pointer = atom({ plugin: 'compact-timing', key: 'pointer' } as const, null as PointerParts | null)
 // Only classic hook events carry the transcript path; pointer mode records it from SessionStart and UserPromptSubmit.
 const transcriptPath = atom({ plugin: 'compact-timing', key: 'transcriptPath' } as const, '')
+// Pointer mode: the user's requests and the files written, which the focus may paraphrase or leave out. Recorded as the
+// session runs, because the plugin cannot read a long transcript (`$.fs.read` stops at 4 MiB). A `/clear` starts it over.
+export type SessionRecord = State['sessionRecord']
+export const emptyRecord: SessionRecord = { requests: [], omittedRequests: 0, files: [], omittedFiles: 0 }
+const sessionRecord = atom({ plugin: 'compact-timing', key: 'sessionRecord' } as const, emptyRecord)
 
 /** The tool input as the model sends it, or null when the state is not one of the two. */
 export const parseMark = (input: { state?: unknown; focus?: unknown; resume?: unknown; userSteps?: unknown }): Mark | null => {
@@ -56,7 +61,7 @@ export const shouldCompact = (current: Mark | null, tokens: number | undefined, 
 const thousands = (tokens: number) => `${Math.round(tokens / 1000)}k`
 
 const pointerFocus =
-  'what the next context must keep. At a `boundary` the plugin replaces the conversation with your focus, `userSteps`, your last message, the transcript path and the commits since the session started; no summary is made. Write it as a handoff: the goal, what is done, the next step, open decisions, file paths. Without a focus the plugin makes a summary instead.'
+  'what the next context must keep. At a `boundary` the plugin replaces the conversation with your focus, the requests the user typed, verbatim, `userSteps`, your last message, the files written, the transcript path and the commits since the session started; no summary is made. Write it as a handoff: the goal, what is done, the next step, open decisions, file paths. Without a focus the plugin makes a summary instead.'
 const pointerUserSteps =
   'with `boundary`: every step, command or question you gave the user that they have not yet reported done or answered: commands exactly, the rest briefly, with what each one is for. Steps in the message that ends the turn need not be listed: the pointer keeps that message.'
 
@@ -203,6 +208,59 @@ export const transcriptSearch = `End the summary with this line: "For exact deta
 
 const maxCommitLines = 40
 const maxLastReply = 3000
+const firstRequests = 3
+const lastRequests = 5
+const maxRequestLength = 2000
+const maxFiles = 40
+const fileWritingTools: Record<string, string> = { Write: 'file_path', Edit: 'file_path', NotebookEdit: 'notebook_path' }
+
+/** A request as the pointer keeps it: one kind of line break, at most maxRequestLength characters; null when empty. */
+export const userRequest = (prompt: string): string | null => {
+  const text = prompt.replace(/\r\n?/g, '\n').trim()
+  if (!text) return null
+  return text.length > maxRequestLength ? `${text.slice(0, maxRequestLength)} ...(cut here; the rest is in the transcript)` : text
+}
+
+/** Adds a request: the first few and the newest few are kept, the ones between only counted. */
+export const addRequest = (record: SessionRecord, request: string): SessionRecord => {
+  const requests = [...record.requests, request]
+  if (requests.length <= firstRequests + lastRequests) return { ...record, requests }
+  requests.splice(firstRequests, 1)
+  return { ...record, requests, omittedRequests: record.omittedRequests + 1 }
+}
+
+/** Adds a written file once; past the limit, further writes to other files are only counted. */
+export const addFile = (record: SessionRecord, path: string): SessionRecord => {
+  if (record.files.includes(path)) return record
+  if (record.files.length >= maxFiles) return { ...record, omittedFiles: record.omittedFiles + 1 }
+  return { ...record, files: [...record.files, path] }
+}
+
+/** The path a file-writing tool call wrote, or null for any other tool. */
+export const writtenPath = (tool: string, input: Record<string, unknown>): string | null => {
+  const field = fileWritingTools[tool]
+  const path = field === undefined ? undefined : input[field]
+  return typeof path === 'string' && path.trim() !== '' ? path.trim() : null
+}
+
+/** The requests part of the pointer, oldest first, with a count where some were left out. */
+export const requestsText = (record: SessionRecord): string => {
+  if (record.requests.length === 0) return 'None recorded.'
+  const lines = record.requests.map(request => `- ${request.replace(/\n/g, '\n  ')}`)
+  if (record.omittedRequests > 0)
+    lines.splice(firstRequests, 0, `- ... ${record.omittedRequests} more between these; search the transcript for them`)
+  return lines.join('\n')
+}
+
+/** The files part of the pointer, in the order first written. */
+export const filesText = (record: SessionRecord): string => {
+  if (record.files.length === 0) return 'None recorded.'
+  const more = record.omittedFiles > 0 ? [`... and ${record.omittedFiles} more writes to files not listed`] : []
+  return [...record.files, ...more].join('\n')
+}
+
+// Said in both parts when the record could not be read, so a failure does not read as an empty session.
+const unreadRecord = 'Not available: the plugin could not read its record. Search the transcript.'
 
 /** The `git log` part of the pointer: the commits, none, or why git gave none. Never throws, so a failed git keeps the pointer. */
 export const commitsText = (
@@ -238,11 +296,13 @@ export const lastReply = (messages: readonly Pick<SessionMessage, 'role' | 'text
 export const pointerText = (parts: PointerParts, reply: string) =>
   [
     `Compacted by the compact-timing plugin at ${thousands(parts.tokens)} tokens, at a \`boundary\` mark, in pointer mode: this message replaced the conversation, and no summary was made.`,
-    'compact-timing: an automatic message from a plugin, not written by the user. You wrote the focus, the open steps and the last message; the plugin added the transcript path and the commits.',
+    'compact-timing: an automatic message from a plugin, not written by the user. You wrote the focus, the open steps and the last message; the plugin added the user\'s requests, the files written, the transcript path and the commits.',
     `## Focus\n${parts.focus || 'None given.'}`,
+    `## The user's requests\nVerbatim, oldest first; a later request can change an earlier one.\n${parts.requests}`,
     `## Open steps you gave the user\n${parts.userSteps || 'None listed.'}`,
     `## Your last message\n${reply || 'None found.'}`,
-    `## Transcript\n${parts.transcriptPath}\nFor anything else from the conversation (what the user asked, error text, paths, numbers), ${transcriptSearchHow} Search it before asking the user for something they may already have given.`,
+    `## Files written this session with Write, Edit or NotebookEdit\nFiles changed through Bash are not listed.\n${parts.files}`,
+    `## Transcript\n${parts.transcriptPath}\nFor anything else from the conversation (requests left out above, error text, paths, numbers), ${transcriptSearchHow} Search it before asking the user for something they may already have given.`,
     `## Commits\n${parts.commits}`,
   ].join('\n\n')
 
@@ -323,6 +383,11 @@ export const register: Register = (on, options) => {
         await update($, transcriptPath, () => e.transcript_path).catch(() => undefined)
       return next(e)
     })
+    // A `/clear` ends the conversation and no `session.start` follows, so the record of the old one is dropped here.
+    on('session.end', async ($, e, next) => {
+      if (e.reason === 'clear') await update($, sessionRecord, () => emptyRecord).catch(() => undefined)
+      return next(e)
+    })
   }
 
   on('tool.call', async ($, e, next) => {
@@ -338,6 +403,10 @@ export const register: Register = (on, options) => {
     }
     const result = await next(e)
     if (e.agentId !== undefined || result.deny !== undefined || result.isError) return result
+    if (isPointerMode) {
+      const written = writtenPath(e.tool, e as unknown as Record<string, unknown>)
+      if (written !== null) await update($, sessionRecord, previous => addFile(previous, written)).catch(() => undefined)
+    }
     const isCommitCall = e.tool === 'Bash' && isCommit((e as unknown as { command: string }).command)
     const isNudged = await read($, nudged).catch(() => true)
     if (!isCommitCall && isNudged) return result
@@ -402,7 +471,16 @@ export const register: Register = (on, options) => {
             const run = await $.process
               .run(['git', 'log', `--since=${since}`, '--format=%h %ad %an: %s', '--date=format:%Y-%m-%d %H:%M'], { cwd: directory, timeoutMs: 10_000 })
               .catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) }))
-            parts = { tokens, focus: marked.focus, userSteps: marked.userSteps ?? '', transcriptPath: path, commits: commitsText(run, directory, since) }
+            const record = await read($, sessionRecord).catch(() => null)
+            parts = {
+              tokens,
+              focus: marked.focus,
+              userSteps: marked.userSteps ?? '',
+              requests: record ? requestsText(record) : unreadRecord,
+              files: record ? filesText(record) : unreadRecord,
+              transcriptPath: path,
+              commits: commitsText(run, directory, since),
+            }
           }
         } catch (error) {
           report($, `compact-timing: pointer failed, making a summary (${error instanceof Error ? error.message : String(error)})`)
@@ -450,6 +528,8 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     const isUserRequest = ['composer', 'bridge', 'sdk'].includes(e.origin.kind) && e.command === undefined && e.isMeta === undefined
     if (isUserRequest) await update($, resumes, () => 0).catch(() => undefined)
+    const request = isPointerMode && isUserRequest ? userRequest(e.text) : null
+    if (request !== null) await update($, sessionRecord, previous => addRequest(previous, request)).catch(() => undefined)
     if (!isContextNoteOn || !isUserRequest) return next(e)
     const [previous, tokens] = await Promise.all([
       read($, noted).catch(() => undefined),

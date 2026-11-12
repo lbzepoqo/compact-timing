@@ -7,8 +7,9 @@ declare module 'claude-code' {
       nudged: boolean
       resumes: number
       ownCompact: 'pending' | { skip: string | null; isPointer?: boolean } | null
-      pointer: { tokens: number; focus: string; userSteps: string; transcriptPath: string; commits: string } | null
+      pointer: { tokens: number; focus: string; userSteps: string; requests: string; files: string; transcriptPath: string; commits: string } | null
       transcriptPath: string
+      sessionRecord: { requests: string[]; omittedRequests: number; files: string[]; omittedFiles: number }
     }
   }
 }

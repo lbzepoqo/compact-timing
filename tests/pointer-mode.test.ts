@@ -2,7 +2,24 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { commitsText, lastReply, markSchema, parseMark, pointerText, resumePrompt, ruleText, transcriptSearch, transcriptSearchHow } from '../hooks/register'
+import {
+  addFile,
+  addRequest,
+  commitsText,
+  emptyRecord,
+  filesText,
+  lastReply,
+  markSchema,
+  parseMark,
+  pointerText,
+  requestsText,
+  resumePrompt,
+  ruleText,
+  transcriptSearch,
+  transcriptSearchHow,
+  userRequest,
+  writtenPath,
+} from '../hooks/register'
 
 const limits = { boundaryTokens: 200_000, softTokens: 300_000 }
 const transcript = '/home/user/.claude/projects/repo/0b8e.jsonl'
@@ -71,20 +88,73 @@ test('the last reply is the newest assistant text, its end kept', () => {
 
 test('the pointer holds the label, focus, open steps, last reply, transcript path and commits', () => {
   const text = pointerText(
-    { tokens: 214_000, focus: 'Next: deploy.', userSteps: 'Run `make test`.', transcriptPath: transcript, commits: 'None in /repo since x.' },
+    {
+      tokens: 214_000,
+      focus: 'Next: deploy.',
+      userSteps: 'Run `make test`.',
+      requests: '- Fix the parser',
+      files: '/repo/parser.ts',
+      transcriptPath: transcript,
+      commits: 'None in /repo since x.',
+    },
     'Done. Run `make deploy`.',
   )
   expect(text.split('\n')[0]).toContain('Compacted by the compact-timing plugin at 214k tokens, at a `boundary` mark, in pointer mode')
   expect(text).toContain('not written by the user')
   expect(text).toContain('## Focus\nNext: deploy.')
+  expect(text).toContain("## The user's requests\nVerbatim, oldest first; a later request can change an earlier one.\n- Fix the parser")
   expect(text).toContain('## Open steps you gave the user\nRun `make test`.')
+  expect(text).toContain('Files changed through Bash are not listed.\n/repo/parser.ts')
+  expect(text).toContain('(requests left out above, error text, paths, numbers)')
   expect(text).toContain('## Your last message\nDone. Run `make deploy`.')
   expect(text).toContain(`## Transcript\n${transcript}\n`)
   expect(text).toContain(transcriptSearchHow)
   expect(text).toContain('## Commits\nNone in /repo since x.')
-  const empty = pointerText({ tokens: 1, focus: '', userSteps: '', transcriptPath: transcript, commits: 'c' }, '')
+  const empty = pointerText({ tokens: 1, focus: '', userSteps: '', requests: 'None recorded.', files: 'None recorded.', transcriptPath: transcript, commits: 'c' }, '')
   expect(empty).toContain('## Focus\nNone given.')
   expect(empty).toContain('## Open steps you gave the user\nNone listed.')
+})
+
+test('a request keeps one kind of line break and is cut at 2,000 characters', () => {
+  expect(userRequest('  Fix the parser\r\nin src/parse.ts\n')).toBe('Fix the parser\nin src/parse.ts')
+  expect(userRequest('/home/user/repo/parse.ts throws, fix it')).toBe('/home/user/repo/parse.ts throws, fix it')
+  expect(userRequest('   ')).toBeNull()
+  const long = userRequest(`${'a'.repeat(2500)}END`) ?? ''
+  expect(long.startsWith('a'.repeat(2000))).toBe(true)
+  expect(long).toContain('...(cut here; the rest is in the transcript)')
+  expect(long).not.toContain('END')
+})
+
+test('the record keeps the first three and the newest five requests and counts the rest', () => {
+  let record = emptyRecord
+  for (let index = 1; index <= 11; index++) record = addRequest(record, `request ${index}`)
+  expect(record.requests).toEqual(['request 1', 'request 2', 'request 3', 'request 7', 'request 8', 'request 9', 'request 10', 'request 11'])
+  expect(record.omittedRequests).toBe(3)
+  const text = requestsText(record)
+  expect(text.split('\n').slice(0, 5)).toEqual([
+    '- request 1',
+    '- request 2',
+    '- request 3',
+    '- ... 3 more between these; search the transcript for them',
+    '- request 7',
+  ])
+  expect(requestsText(addRequest(emptyRecord, 'line one\nline two'))).toBe('- line one\n  line two')
+  expect(requestsText(emptyRecord)).toBe('None recorded.')
+})
+
+test('the record lists each written file once, at most 40, and counts later writes', () => {
+  expect(writtenPath('Write', { file_path: '/repo/a.ts' })).toBe('/repo/a.ts')
+  expect(writtenPath('Edit', { file_path: '/repo/a.ts' })).toBe('/repo/a.ts')
+  expect(writtenPath('NotebookEdit', { notebook_path: '/repo/n.ipynb' })).toBe('/repo/n.ipynb')
+  expect(writtenPath('Read', { file_path: '/repo/a.ts' })).toBeNull()
+  expect(writtenPath('Write', {})).toBeNull()
+  let record = addFile(addFile(emptyRecord, '/repo/a.ts'), '/repo/a.ts')
+  expect(record.files).toEqual(['/repo/a.ts'])
+  for (let index = 0; index < 45; index++) record = addFile(record, `/repo/file${index}.ts`)
+  expect(record.files.length).toBe(40)
+  expect(record.omittedFiles).toBe(6)
+  expect(filesText(record)).toContain('... and 6 more writes to files not listed')
+  expect(filesText(emptyRecord)).toBe('None recorded.')
 })
 
 test('the resume prompt after a pointer does not speak of a summary', () => {
@@ -103,6 +173,8 @@ type Seen = { summarized: string[]; installed: string[]; prompts: string[]; gitA
 const world = (on: On, $: Engine, tokens = 250_000): Seen => {
   const seen: Seen = { summarized: [], installed: [], prompts: [], gitArgs: [], logs: [] }
   on('classic.SessionStart', () => ({}) as never)
+  on('classic.UserPromptSubmit', () => ({}) as never)
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }) as never)
   on('turn.complete', (_, e) => ({ text: e.answer }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   // A call a plugin makes on `$` is answered with `{ value }`.
@@ -140,6 +212,8 @@ const world = (on: On, $: Engine, tokens = 250_000): Seen => {
     return { value: undefined } as never
   })
   on('ui.toast', () => ({ value: undefined }) as never)
+  // Tools other than the mark: the call succeeds.
+  on('tool.call', () => ({ result: 'ok' }) as never)
   return seen
 }
 
@@ -216,5 +290,49 @@ test('pointer mode: Claude Code compactions, a typed /compact and a subagent kee
   await $.session.compact({ trigger: 'manual', messages } as never)
   await $.session.compact({ trigger: 'auto', messages, agentId: 'a1' } as never)
   expect(seen.summarized).toEqual(['auto', 'precompute', 'manual', 'auto'])
+})
+
+
+const prompt = ($: Engine, text: string, origin = 'sdk', extra: Record<string, unknown> = {}) =>
+  $.prompt.submit({ text, wait: false, origin: { kind: origin }, ...extra } as never)
+
+test('pointer mode: the pointer quotes the user\'s requests and lists the files written', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $)
+  await start($)
+  await prompt($, 'Fix the parser in src/parse.ts', 'composer')
+  await prompt($, '/compact', 'composer', { command: { name: 'compact', args: '' } })
+  await prompt($, 'a meta prompt', 'sdk', { isMeta: true })
+  await prompt($, 'compact-timing: an automatic prompt from a plugin', 'plugin')
+  await prompt($, 'Also add a test')
+  await $.tool.call({ tool: 'Write', file_path: '/repo/tests/parse.test.ts' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/src/parse.ts' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/src/parse.ts' } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/repo/x.ts', agentId: 'a1' } as never)
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
+  await endTurn($)
+  const pointer = seen.installed[0] ?? ''
+  expect(pointer).toContain("## The user's requests\nVerbatim, oldest first; a later request can change an earlier one.\n- Fix the parser in src/parse.ts\n- Also add a test\n")
+  expect(pointer).toContain('## Files written this session with Write, Edit or NotebookEdit\nFiles changed through Bash are not listed.\n/repo/tests/parse.test.ts\n/repo/src/parse.ts\n')
+  expect(pointer).not.toContain('meta prompt')
+  expect(pointer).not.toContain('- compact-timing:')
+  expect(pointer).not.toContain('- /compact')
+  expect(pointer).not.toContain('/repo/x.ts')
+})
+
+test('pointer mode: a /clear starts the record over', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $)
+  await start($)
+  await prompt($, 'Old task')
+  await $.tool.call({ tool: 'Write', file_path: '/repo/old.ts' } as never)
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  await $.classic.UserPromptSubmit({ prompt: 'New task', transcript_path: '/home/user/.claude/projects/repo/new.jsonl' } as never)
+  await prompt($, 'New task')
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
+  await endTurn($)
+  const pointer = seen.installed[0] ?? ''
+  expect(pointer).toContain('- New task')
+  expect(pointer).not.toContain('Old task')
+  expect(pointer).toContain('Files changed through Bash are not listed.\nNone recorded.')
+  expect(pointer).toContain('## Transcript\n/home/user/.claude/projects/repo/new.jsonl')
 })
 
