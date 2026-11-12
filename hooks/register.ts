@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { PluginState, Register, SessionCompactResult, SessionMessage, ToolUseSummary } from 'claude-code'
+import type { PluginState, ProcessRunInit, ProcessRunResult, Register, SessionCompactResult, SessionMessage, ToolUseSummary } from 'claude-code'
 
 // The stored shapes are declared once, in types/index.d.ts.
 type State = PluginState['compact-timing']
@@ -380,6 +380,10 @@ export const uncommittedText = (
 
 /** Whether a git run gave its answer. */
 const isGitAnswer = (run: { exitCode: number } | { error: string }) => 'exitCode' in run && run.exitCode === 0
+
+/** A git run that never throws: a git that cannot start or does not finish in time gives `{ error }`. */
+const runGit = ($: { process: { run: (argv: readonly string[], init?: ProcessRunInit) => Promise<ProcessRunResult> } }, gitArguments: readonly string[], init: ProcessRunInit) =>
+  $.process.run(['git', ...gitArguments], init).catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) }))
 
 /**
  * The model's last message with text: the mark is set inside a turn, so steps given to the user in the turn's closing
@@ -764,10 +768,7 @@ export const register: Register = (on, options) => {
             const directory = await $.session.cwd()
             const since = new Date(usage.startedAt).toISOString()
             // The author tells the model's own commits from ones a pull brought in.
-            const git = (...gitArguments: string[]) =>
-              $.process
-                .run(['git', ...gitArguments], { cwd: directory, timeoutMs: 10_000 })
-                .catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) }))
+            const git = (...gitArguments: string[]) => runGit($, gitArguments, { cwd: directory, timeoutMs: 10_000 })
             // `--no-optional-locks`: a status in the background must not hold the index lock against a `git add` or
             // `git commit` the user or another session runs at that moment. The other two options override settings
             // that would hide untracked files or write a path with other than plain letters as escapes.
