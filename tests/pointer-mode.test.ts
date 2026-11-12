@@ -638,6 +638,30 @@ test('the commit reminder follows a command that committed, not one that names a
   expect(seen.gitArgs).toEqual([])
 })
 
+test('at the soft limit, only a commit reminder that names resume takes the place of the size nudge', async ($, on) => {
+  world(on, $, 310_000)
+  await start($)
+  const context = async (command: string) => ((await $.tool.call({ tool: 'Bash', command } as never)) as { context?: string[] }).context ?? []
+  // The busy reminder asks only whether the step is done, so the nudge comes with it, once.
+  await setMark($, { state: 'busy' })
+  const first = await context('git commit -qm one')
+  expect(first.length).toBe(2)
+  expect(first[0]).toContain('the mark is `busy`')
+  expect(first[1]).toContain('holds 310k tokens')
+  expect((await context('git commit -qm two')).length).toBe(1)
+  expect(await context('ls')).toEqual([])
+})
+
+test('at the soft limit, a commit reminder without a busy mark uses up the size nudge', async ($, on) => {
+  world(on, $, 310_000)
+  await start($)
+  const context = async (command: string) => ((await $.tool.call({ tool: 'Bash', command } as never)) as { context?: string[] }).context ?? []
+  const first = await context('git commit -qm one')
+  expect(first.length).toBe(1)
+  expect(first[0]).toContain('add `resume` true')
+  expect(await context('ls')).toEqual([])
+})
+
 /**
  * A session in pointer mode whose commands write to HEAD's reflog what `commits` gives them, oldest first. What a call
  * wrote is dated now while it runs and in the past once the next call starts, as for calls some seconds apart.

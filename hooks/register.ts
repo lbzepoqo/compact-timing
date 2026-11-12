@@ -788,6 +788,8 @@ export const register: Register = (on, options) => {
     const context: string[] = []
     const isReminded = isCommitting && shouldRemind(current, tokens, limits)
     if (isReminded) context.push(commitReminder(markTool, current))
+    // Only the reminder for a mark that is not busy names `resume`, so only it says what the nudge says.
+    const isResumeReminded = isReminded && current?.state !== 'busy'
     if (tokens !== undefined && shouldNudge(current, tokens, isNudged, limits)) {
       // Decided inside the write: tool hooks of parallel calls run at the same time, and only one may send the nudge.
       let isFirst = false
@@ -795,8 +797,7 @@ export const register: Register = (on, options) => {
         isFirst = !previous
         return true
       }).then(() => true, () => false)
-      // A commit reminder already says the same, so it uses up the nudge.
-      if (isStored && isFirst && !isReminded) context.push(sizeNudge(tokens, markTool))
+      if (isStored && isFirst && !isResumeReminded) context.push(sizeNudge(tokens, markTool))
     }
     return context.length ? { ...result, context: [...(result.context ?? []), ...context] } : result
   })
