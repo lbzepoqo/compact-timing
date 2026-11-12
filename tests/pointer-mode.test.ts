@@ -5,12 +5,15 @@ import type { On } from 'claude-code'
 import {
   addFile,
   addRequest,
+  afterLastCommit,
   commitsText,
   emptyRecord,
   filesText,
+  isCommitCall,
   lastReply,
   markSchema,
   parseMark,
+  pointerAdvice,
   pointerText,
   requestsText,
   resumePrompt,
@@ -18,6 +21,9 @@ import {
   transcriptSearch,
   transcriptSearchHow,
   userRequest,
+  workEntries,
+  workPart,
+  workText,
   writtenPath,
 } from '../hooks/register'
 
@@ -98,6 +104,7 @@ test('the pointer holds the label, focus, open steps, last reply, transcript pat
       commits: 'None in /repo since x.',
     },
     'Done. Run `make deploy`.',
+    '## Your work after the last commit\nNothing but your last message.',
   )
   expect(text.split('\n')[0]).toContain('Compacted by the compact-timing plugin at 214k tokens, at a `boundary` mark, in pointer mode')
   expect(text).toContain('not written by the user')
@@ -107,12 +114,151 @@ test('the pointer holds the label, focus, open steps, last reply, transcript pat
   expect(text).toContain('Files changed through Bash are not listed.\n/repo/parser.ts')
   expect(text).toContain('(requests left out above, error text, paths, numbers)')
   expect(text).toContain('## Your last message\nDone. Run `make deploy`.')
+  expect(text).toContain('## Open steps you gave the user\nRun `make test`.\n\n## Your work after the last commit\nNothing but your last message.\n\n## Your last message')
+  expect(text).toContain('before acting on a command, an error or a value the focus names without giving it exactly')
   expect(text).toContain(`## Transcript\n${transcript}\n`)
   expect(text).toContain(transcriptSearchHow)
   expect(text).toContain('## Commits\nNone in /repo since x.')
-  const empty = pointerText({ tokens: 1, focus: '', userSteps: '', requests: 'None recorded.', files: 'None recorded.', transcriptPath: transcript, commits: 'c' }, '')
+  const empty = pointerText({ tokens: 1, focus: '', userSteps: '', requests: 'None recorded.', files: 'None recorded.', transcriptPath: transcript, commits: 'c' }, '', 'work')
   expect(empty).toContain('## Focus\nNone given.')
   expect(empty).toContain('## Open steps you gave the user\nNone listed.')
+})
+
+const shell = (command: string, text: string, isError = false) => ({ tool: 'Bash', input: { command }, text, ...(isError ? { isError: true as const } : {}) })
+// A fix that was committed, then a second change whose test fails, the mark and the closing message.
+const session = [
+  { role: 'user' as const, text: 'Fix the parser', toolUses: [] },
+  { role: 'assistant' as const, text: 'Reading the parser.', toolUses: [{ tool: 'Read', input: { file_path: '/repo/src/parse.ts' }, text: 'x'.repeat(5000) }] },
+  { role: 'user' as const, text: '', toolUses: [] },
+  { role: 'assistant' as const, text: '', toolUses: [shell('git add -A && git commit -m "Fix the parser"', '[main abc1234] Fix the parser\n 1 file changed')] },
+  { role: 'user' as const, text: 'Also handle tabs' },
+  { role: 'assistant' as const, text: 'Tabs reach the lexer as spaces, so the fix goes there.', toolUses: [{ tool: 'Edit', input: { file_path: '/repo/src/lex.ts' }, text: 'ok' }] },
+  { role: 'assistant' as const, text: '', toolUses: [shell('bun test', `${'.'.repeat(300)}\n12 pass`), shell('bun test tabs', `error: expected 2\n${'y'.repeat(900)}\n1 fail`, true)] },
+  { role: 'assistant' as const, text: '', toolUses: [{ tool: markTool, input: { state: 'boundary' }, text: 'The mark is `boundary`.' }] },
+  { role: 'assistant' as const, text: 'The tab test still fails. Should I change the lexer?', toolUses: [] },
+]
+
+test('a commit is found in either shell, and only there', () => {
+  expect(isCommitCall('Bash', { command: 'git commit -m x' })).toBe(true)
+  expect(isCommitCall('PowerShell', { command: 'git add -A; git commit -m x' })).toBe(true)
+  expect(isCommitCall('Bash', { command: 'git status' })).toBe(false)
+  expect(isCommitCall('Write', { command: 'git commit -m x' })).toBe(false)
+  expect(isCommitCall('Bash', {})).toBe(false)
+})
+
+test('the work entries hold what was said and each tool call, without the mark, the last reply and read results', () => {
+  const entries = workEntries(session, markTool)
+  expect(entries.map(entry => entry.text.split('\n')[0])).toEqual([
+    'You: Reading the parser.',
+    'Read: /repo/src/parse.ts',
+    'Bash: git add -A && git commit -m "Fix the parser"',
+    'You: Tabs reach the lexer as spaces, so the fix goes there.',
+    'Edit: /repo/src/lex.ts',
+    'Bash: bun test',
+    'Bash: bun test tabs',
+  ])
+  expect(entries[1]?.text).toBe('Read: /repo/src/parse.ts')
+  expect(entries[2]?.isCommit).toBe(true)
+  expect(entries[4]?.text).toBe('Edit: /repo/src/lex.ts')
+  expect(entries[5]?.text.endsWith('\n  12 pass')).toBe(true)
+  expect(entries[5]?.text.length).toBeLessThan(240)
+  expect(entries[6]?.isFailedShell).toBe(true)
+  expect(entries[6]?.text).toContain('\n  failed: error: expected 2\n  y')
+  expect(entries[6]?.text).toContain('...(cut)...')
+  expect(entries[6]?.text.endsWith('1 fail')).toBe(true)
+  expect(afterLastCommit(entries).entries.length).toBe(4)
+  expect(afterLastCommit(entries).isCommitted).toBe(true)
+  expect(afterLastCommit(entries.slice(3)).isCommitted).toBe(false)
+})
+
+test('only a command that printed git\'s commit line counts as a commit', () => {
+  const committed = (command: string, text: string | undefined, isError = false) =>
+    workEntries([{ role: 'assistant', text: '', toolUses: [{ tool: 'Bash', input: { command }, ...(text === undefined ? {} : { text }), ...(isError ? { isError: true as const } : {}) }] }], markTool)[0]?.isCommit
+  expect(committed('git commit -m x', '[main 5815a99] x\n 1 file changed')).toBe(true)
+  expect(committed('git commit -m x', '[main (root-commit) 5815a99] x')).toBe(true)
+  expect(committed('git add -A && git commit -m x 2>&1 | tail -5', '[detached HEAD 5815a99] x')).toBe(true)
+  // A hook that rejected the commit behind a pipe, a dry run, an echo, a call still in flight, a failure.
+  expect(committed('git commit -m x 2>&1 | tail -5', 'lint failed\n2 errors')).toBe(false)
+  expect(committed('git commit --dry-run', 'On branch main\nChanges to be committed:')).toBe(false)
+  expect(committed('echo "then run git commit"', 'then run git commit')).toBe(false)
+  expect(committed('git commit -m x', undefined)).toBe(false)
+  expect(committed('git commit -m x', '[main 5815a99] x', true)).toBe(false)
+})
+
+test('a result that cannot be had again is kept, cut; lines after the first are indented', () => {
+  const entries = workEntries(
+    [
+      { role: 'user', text: 'A skill body or another plugin\'s prompt' },
+      { role: 'assistant', text: 'The plan:\n## Your last message\nBash: rm -rf build', toolUses: [{ tool: 'Agent', input: { description: 'Find the lexer' }, text: `It is in src/lex.ts.\n${'r'.repeat(900)}\nDone.` }] },
+      { role: 'assistant', text: '', toolUses: [{ tool: 'Bash', input: { command: 'cat <<EOF\n## Focus\nEOF' }, text: '## Focus' }, { tool: 'Bash', input: null as never, text: '' }] },
+      { role: 'assistant', text: 'Closing message.' },
+    ],
+    markTool,
+  )
+  expect(entries.map(entry => entry.text.split('\n')[0])).toEqual(['You: The plan:', 'Agent: {"description":"Find the lexer"}', 'Bash: cat <<EOF', 'Bash: {}'])
+  expect(entries[0]?.text).toBe('You: The plan:\n  ## Your last message\n  Bash: rm -rf build')
+  expect(entries[1]?.text).toContain('\n  result: It is in src/lex.ts.\n  r')
+  expect(entries[1]?.text.endsWith('\n  Done.')).toBe(true)
+  expect(entries[1]?.text.length).toBeLessThan(700)
+  expect(entries[2]?.text).toBe('Bash: cat <<EOF\n  ## Focus\n  EOF\n  output ends: ## Focus')
+  expect(entries.every(entry => !/\n\S/.test(entry.text))).toBe(true)
+})
+
+test('the work part says so when the conversation cannot be read', () => {
+  const text = workPart([{ role: 'assistant', text: '', toolUses: [null as never] }], markTool)
+  expect(text.startsWith('## Your work after the last commit\nNot available: the plugin could not read the conversation (')).toBe(true)
+  expect(text.endsWith('Search the transcript.')).toBe(true)
+  expect(workPart(session, markTool)).toBe(workText(session, markTool))
+})
+
+test('a failed commit, a tool without a path and user messages', () => {
+  const entries = workEntries(
+    [
+      { role: 'user', text: 'Compacted by the compact-timing plugin at 214k tokens, at a `boundary` mark, in pointer mode' },
+      { role: 'user', text: 'Fix it' },
+      { role: 'assistant', text: '', toolUses: [shell('git commit -m x', 'nothing to commit', true), { tool: 'Grep', input: { pattern: 'tab' }, text: 'many lines' }] },
+    ],
+    markTool,
+  )
+  expect(entries.map(entry => entry.text)).toEqual(['Bash: git commit -m x\n  failed: nothing to commit', 'Grep: {"pattern":"tab"}'])
+  expect(entries[0]?.isCommit).toBe(false)
+})
+
+test('the work part holds what came after the last commit, the newest kept when it is long', () => {
+  const text = workText(session, markTool)
+  expect(text.startsWith('## Your work after the last commit\nA digest the plugin made')).toBe(true)
+  expect(text).toContain('left out.\nYou: Tabs reach the lexer')
+  expect(text).not.toContain('Also handle tabs')
+  expect(text).toContain('Bash: bun test tabs\n  failed: error: expected 2')
+  expect(text).not.toContain('Reading the parser')
+  expect(text).not.toContain('Should I change the lexer?')
+  expect(workText(session.slice(0, 4), markTool)).toBe('## Your work after the last commit\nNothing but your last message.')
+  expect(workText([{ role: 'assistant', text: 'One.' }, { role: 'assistant', text: 'Two.' }], markTool)).toContain('## Your work since the conversation started or was last compacted\nA digest')
+  expect(workText([{ role: 'user', text: 'Fix it' }], markTool)).toBe('## Your work since the conversation started or was last compacted\nNothing but your last message.')
+  // Each entry is 'You: reply N ' and 1,000 letters, and the last message is not an entry.
+  const long = Array.from({ length: 23 }, (_, index) => ({ role: 'assistant' as const, text: `reply ${index} ${'z'.repeat(1000)}` }))
+  const cut = workText(long, markTool)
+  expect(cut).toContain('... 3 earlier entries cut; search the transcript for them\nYou: reply 3 ')
+  expect(cut).toContain('You: reply 21 ')
+  expect(cut).not.toContain('reply 22 ')
+  expect(cut.length).toBeLessThan(21_000)
+})
+
+test('the mark advice asks for a focus, a fuller focus, and names a last shell command that failed', () => {
+  const focus = 'Goal: tabs parse as spaces. Done: the parser fix, committed. Next: change the lexer in src/lex.ts so the tab test passes. Open: whether a tab counts as one column or eight. Ruled out: the parser, which never sees tabs.'
+  expect(pointerAdvice({ state: 'busy', focus: '' }, session, markTool)).toEqual([])
+  expect(pointerAdvice({ state: 'boundary', focus: '' }, session, markTool)).toEqual([
+    'Pointer mode: the mark has no focus, so the plugin will make a summary instead of a pointer. For a pointer, call again with a focus.',
+  ])
+  const thin = pointerAdvice({ state: 'boundary', focus: 'Next: deploy.' }, session.slice(0, 4), markTool)
+  expect(thin.length).toBe(1)
+  expect(thin[0]).toContain('the focus is 13 characters')
+  const failed = pointerAdvice({ state: 'boundary', focus }, session, markTool)
+  expect(failed.length).toBe(1)
+  expect(failed[0]).toContain('your last shell command failed and nothing was committed after it (Bash: bun test tabs)')
+  expect(failed[0]).toContain('call again with `busy`')
+  expect(pointerAdvice({ state: 'boundary', focus }, session.slice(0, 4), markTool)).toEqual([])
+  expect(pointerAdvice({ state: 'boundary', focus }, [], markTool)).toEqual([])
 })
 
 test('a request keeps one kind of line break and is cut at 2,000 characters', () => {
@@ -179,7 +325,11 @@ const world = (on: On, $: Engine, tokens = 250_000): Seen => {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   // A call a plugin makes on `$` is answered with `{ value }`.
   on('tool.register', (_, e) => ({ value: { tool: `mcp__compact-timing__${e.name}` } }) as never)
-  on('session.usage', () => ({ value: { startedAt, context: { tokens, window: 1_000_000 }, rateLimits: [], changed: [] } }) as never)
+  // A negative size stands for a session whose usage cannot be read.
+  on('session.usage', () => {
+    if (tokens < 0) throw new Error('no usage')
+    return { value: { startedAt, context: { tokens, window: 1_000_000 }, rateLimits: [], changed: [] } } as never
+  })
   on('session.cwd', () => ({ value: '/repo' }) as never)
   on('process.run', (_, e) => {
     seen.gitArgs.push([...e.argv])
@@ -222,6 +372,7 @@ const start = async ($: Engine, path = transcript) => {
   await $.session.start({ cwd: '/repo', surface: null, isInteractive: false })
 }
 const setMark = ($: Engine, input: Record<string, unknown>) => $.tool.call({ tool: markTool, ...input } as never)
+const markAnswer = async ($: Engine, input: Record<string, unknown>) => String((await setMark($, input) as { result?: unknown }).result)
 const endTurn = ($: Engine) => $.turn.complete({ reason: 'answer', answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't1' })
 
 test('pointer mode: the plugin compaction at a boundary replaces the conversation without the summarizer', { options: { pointerMode: true } }, async ($, on) => {
@@ -336,3 +487,47 @@ test('pointer mode: a /clear starts the record over', { options: { pointerMode: 
   expect(pointer).toContain('## Transcript\n/home/user/.claude/projects/repo/new.jsonl')
 })
 
+test('pointer mode: the mark answer carries the advice only when the mark can compact', { options: { pointerMode: true } }, async ($, on) => {
+  world(on, $)
+  on('session.messages', () => ({ value: session }) as never)
+  await start($)
+  const answer = await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })
+  expect(answer.split('\n')[0]).toBe('The mark is `boundary`.')
+  expect(answer).toContain('Pointer mode: the focus is 13 characters')
+  expect(answer).toContain('your last shell command failed and nothing was committed after it (Bash: bun test tabs)')
+  expect(await markAnswer($, { state: 'busy', focus: 'Next: deploy.' })).toBe('The mark is `busy`.')
+})
+
+test('pointer mode: below boundaryTokens the mark answer has no advice', { options: { pointerMode: true } }, async ($, on) => {
+  world(on, $, 50_000)
+  on('session.messages', () => ({ value: session }) as never)
+  await start($)
+  expect(await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })).toBe('The mark is `boundary`.')
+})
+
+test('pointer mode off: the mark answer has no advice', async ($, on) => {
+  world(on, $)
+  on('session.messages', () => ({ value: session }) as never)
+  await start($)
+  expect(await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })).toBe('The mark is `boundary`.')
+})
+
+test('pointer mode: when the messages cannot be read the mark is still set', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $)
+  on('session.messages', () => {
+    throw new Error('no transcript')
+  })
+  await start($)
+  expect(await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })).toBe('The mark is `boundary`.')
+  await endTurn($)
+  expect(seen.installed[0]).toContain('## Your work since the conversation started or was last compacted\n')
+})
+
+test('pointer mode: at an unknown size the mark answer has no advice', { options: { pointerMode: true } }, async ($, on) => {
+  world(on, $, -1)
+  on('session.messages', () => ({ value: session }) as never)
+  await start($)
+  const answer = await markAnswer($, { state: 'boundary', focus: 'Next: deploy.', resume: true })
+  expect(answer).toContain('size unknown')
+  expect(answer).not.toContain('Pointer mode')
+})

@@ -22,7 +22,7 @@ The plugin gives the model one tool, `mark`:
 | Input | Meaning |
 |---|---|
 | `state` | `boundary` or `busy` (below) |
-| `focus` | What the next context must keep. Passed to the compaction as its instructions |
+| `focus` | What the next context must keep. Passed to the compaction as its instructions; in pointer mode it is the handoff itself |
 | `resume` | With `boundary`: steps of the current request remain, so compact and continue (see [Compact and resume](#compact-and-resume)) |
 | `userSteps` | Pointer mode only: steps the model gave the user that are still open |
 
@@ -50,7 +50,7 @@ A plugin can compact only between turns, so a long turn (a feature build, a whol
 
 The model often forgets the tool, so the plugin adds short notes at the moments a mark is most useful:
 
-- **After a `git commit`**, when the context has reached `boundaryTokens` or the mark is `busy`: set the mark. A commit is the most common task boundary.
+- **After a `git commit`** (through Bash or PowerShell), when the context has reached `boundaryTokens` or the mark is `busy`: set the mark. A commit is the most common task boundary.
 - **Inside a long turn**, on the first tool result at `softTokens` or more: at the next saved point, set `boundary` with `resume` and end the turn. Once per compaction.
 - **On a prompt at `boundaryTokens` or more** (a topic switch without a commit gets no mark): suggest `/clear` if the request is unrelated, a short handoff if it needs a few facts, or set `boundary` at the next break if it continues the work. Once, and again only after the context falls below `boundaryTokens`. Turn off with `contextNote`.
 
@@ -75,15 +75,36 @@ Each compaction also shows a toast with the size. A compaction that fails or is 
 
 Off by default. With `pointerMode` on, the plugin's compaction at a `boundary` mark makes no summary. It replaces the conversation with one message that holds:
 
-- the mark's focus, which the model is asked to write as a handoff: goal, what is done, next step, open decisions, file paths;
+- the mark's focus, which the model is asked to write as a handoff: goal, what is done, next step, open decisions, what it ruled out and why, file paths;
 - the requests you typed this session, verbatim: the first three and the newest five, each up to 2,000 characters, with a count of the ones between, so your own words are there next to the model's paraphrase in the focus;
 - the open user steps, which the model lists in `userSteps` because no summarizer runs to find them;
+- a digest of the work after the last commit, up to 20,000 characters, the newest kept (see [The work digest](#the-work-digest));
 - the model's last message, up to 3,000 characters (steps it gives you after setting the mark are in there);
 - the files the model wrote this session with Write, Edit or NotebookEdit, each once, at most 40 (files changed through Bash are not listed);
 - the transcript path, with the same search line a summary ends with;
 - `git log` since the session started, at most 40 commits with authors, so pulled-in commits stand out. If git fails, the message says why.
 
 The message starts with "Compacted by the compact-timing plugin at 214k tokens, at a `boundary` mark, in pointer mode". A resume after it tells the model to continue from the focus and to check its last message, the commits and `git status` before repeating a step.
+
+### The work digest
+
+A pointer is only as good as its focus, and the model does not set `busy` during a debugging session (see [Results and limits](#results-and-limits)), so work that was never committed would otherwise be lost. The plugin therefore adds, from the conversation it is about to replace, what came after the last successful `git commit`:
+
+- what the model said, each message cut at 1,500 characters (your requests are in their own part);
+- each tool call in one line: the command, the file, or the input;
+- for a shell command, the last 200 characters of its output; for a call that failed, the start and the end of the error, 600 characters; for any other result that cannot be had again (a subagent's report, your answer to a question, a fetched page), its start and end, 600 characters.
+
+Results of Read, Grep, Glob, Write, Edit and NotebookEdit are left out, since the file is on disk. A mark set right after a commit has little after it, so the part is a few lines; work that was never committed gets the room. With no commit in the conversation the digest covers its end. When it is cut, a line at its top says how many entries were left out.
+
+A commit counts when a Bash or PowerShell command holds `git commit`, did not fail, and its output has the line git prints for a commit (`[main 5815a99] Fix the parser`). A commit made with `-q`, or whose output a pipe cut away, is missed, and the digest is then longer than it needs to be.
+
+### What the mark tool answers
+
+When a `boundary` mark can compact (the context is known to have reached `boundaryTokens`), the tool's answer adds, while the model still has the conversation:
+
+- with no focus: this compaction will make a summary, and a focus makes it a pointer;
+- with a focus under 200 characters: it is all the next context gets, so call again with a fuller one if it leaves something out, keeping `resume` and `userSteps`;
+- when the last shell command after the last commit failed: set `busy` if the step is unfinished, or say in the focus what failed.
 
 Every other compaction still makes a summary: with no mark at `softTokens`, a `/compact` you type, Claude Code's own, and a subagent's. The plugin also falls back to a summary, with a transcript line saying so, when the mark has no focus or the transcript path is unknown. It learns the path from Claude Code's classic SessionStart and UserPromptSubmit events, since the plugin API has no other way to get it.
 
@@ -113,6 +134,7 @@ echo '{"boundaryTokens": "150000"}' | claude plugin configure compact-timing@com
 - **Search line.** On a manual `/compact` of a short session, the summaries of Opus, Sonnet and Haiku each ended with the transcript search line.
 - **Headless sessions.** Before 0.9.1 the plugin never compacted in SDK sessions, and the only sign was a toast those hosts do not show. The `/compact` path is tested in an SDK session and in the terminal.
 - **Pointer mode.** Tested in two headless stream-json sessions with Haiku: 28k tokens became 0.4k in 5 ms with no summary request. With `resume`, Haiku checked `git status` and `git log`, then did the remaining step from the focus, but did not search the transcript for a command the focus only described. Not yet compared with summaries in daily use.
+- **Work digest and mark answer.** Tested in one headless session with Haiku: a commit, then a shell command that failed, then a `boundary` mark with a 28-character focus. The tool's answer named the short focus and the failed command, and the pointer's digest held only that command and its error, not the committed steps before it. Haiku ended the turn without writing a fuller focus, so the answer informs the model but does not make it act.
 
 ## Develop
 

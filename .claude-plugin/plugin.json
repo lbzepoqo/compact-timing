@@ -31,7 +31,7 @@
     "pointerMode": {
       "type": "boolean",
       "title": "Pointer mode",
-      "description": "At a boundary mark, replace the conversation with one message (the mark focus, the user's requests verbatim, the open user steps, the last reply, the files written, the transcript path and the commits since the session started) instead of a summary. Other compactions keep the summary",
+      "description": "At a boundary mark, replace the conversation with one message (the mark focus, the user's requests verbatim, the open user steps, a digest of the work after the last commit, the last reply, the files written, the transcript path and the commits since the session started) instead of a summary. Other compactions keep the summary",
       "default": false
     }
   }

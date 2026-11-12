@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { PluginState, Register, SessionCompactResult, SessionMessage } from 'claude-code'
+import type { PluginState, Register, SessionCompactResult, SessionMessage, ToolUseSummary } from 'claude-code'
 
 // The stored shapes are declared once, in types/index.d.ts.
 type State = PluginState['compact-timing']
@@ -61,7 +61,7 @@ export const shouldCompact = (current: Mark | null, tokens: number | undefined, 
 const thousands = (tokens: number) => `${Math.round(tokens / 1000)}k`
 
 const pointerFocus =
-  'what the next context must keep. At a `boundary` the plugin replaces the conversation with your focus, the requests the user typed, verbatim, `userSteps`, your last message, the files written, the transcript path and the commits since the session started; no summary is made. Write it as a handoff: the goal, what is done, the next step, open decisions, file paths. Without a focus the plugin makes a summary instead.'
+  'what the next context must keep. At a `boundary` the plugin replaces the conversation with your focus, the requests the user typed, verbatim, `userSteps`, a digest of your work after the last commit (your messages, the tool calls, what failed), your last message, the files written, the transcript path and the commits since the session started; no summary is made. Write it as a handoff: the goal, what is done, the next step, open decisions, what you ruled out and why, file paths. Without a focus the plugin makes a summary instead.'
 const pointerUserSteps =
   'with `boundary`: every step, command or question you gave the user that they have not yet reported done or answered: commands exactly, the rest briefly, with what each one is for. Steps in the message that ends the turn need not be listed: the pointer keeps that message.'
 
@@ -155,6 +155,13 @@ export const ownCompactFailure = (outcome: OwnCompact): string | null => {
 /** A `git commit`, also after global options such as `-C <dir>`, `-c <key=value>` or `--no-pager`. */
 export const isCommit = (command: string) =>
   /\bgit(?:\s+(?:-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+)|--?[\w-]+(?:=\S+)?))*\s+commit(?![\w-])/.test(command)
+
+// On Windows the model commits through either shell.
+const shellTools = ['Bash', 'PowerShell']
+
+/** A shell tool call whose command holds a `git commit`. */
+export const isCommitCall = (tool: string, input: Record<string, unknown>): boolean =>
+  shellTools.includes(tool) && typeof input.command === 'string' && isCommit(input.command)
 
 /**
  * Read right after a commit's result. The tool description alone is often missed, so the reminder
@@ -286,23 +293,173 @@ export const commitsText = (
  * message come after it. The end is kept, since a closing message ends with what it asks.
  */
 export const lastReply = (messages: readonly Pick<SessionMessage, 'role' | 'text'>[]): string => {
-  const last = [...messages].reverse().find(message => message.role === 'assistant' && message.text.trim() !== '')
-  if (!last) return ''
-  const text = last.text.trim()
+  const text = messages[lastReplyIndex(messages)]?.text.trim() ?? ''
   return text.length > maxLastReply ? `...${text.slice(-maxLastReply)}` : text
 }
 
+/** Where the model's last message with text is, or -1. */
+const lastReplyIndex = (messages: readonly Pick<SessionMessage, 'role' | 'text'>[]): number => {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (message?.role === 'assistant' && message.text.trim() !== '') return index
+  }
+  return -1
+}
+
+const maxWork = 20_000
+const maxWorkReply = 1500
+const maxWorkCall = 300
+const maxWorkResult = 600
+const maxWorkOutput = 200
+const minFocus = 200
+// Tools whose result is on disk or can be had again by the same call, so the digest names the call alone.
+const repeatableTools = ['Read', 'Grep', 'Glob', 'Write', 'Edit', 'NotebookEdit']
+
+/**
+ * The line git prints for a commit it made: `[main 5815a99] Fix the parser`. A command that only names a commit (an
+ * echo, a dry run) or hides its failure behind a pipe prints none, and one whose output is cut or quiet is missed,
+ * which only makes the digest longer.
+ */
+const committedLine = /^\[[^\]\n]+ [0-9a-f]{7,40}\] /m
+
+/** The start of a text, with a note where it was cut. */
+const clipEnd = (text: string, limit: number) => (text.length > limit ? `${text.slice(0, limit)} ...(cut)` : text)
+
+/** The start and the end of a text: an error names itself first, and a test run sums up last. */
+const clipMiddle = (text: string, limit: number) => {
+  if (text.length <= limit) return text
+  const head = Math.floor(limit / 3)
+  return `${text.slice(0, head)} ...(cut)... ${text.slice(-(limit - head))}`
+}
+
+type WorkToolUse = Pick<ToolUseSummary, 'tool' | 'input' | 'text' | 'isError'>
+type WorkMessage = Pick<SessionMessage, 'role' | 'text'> & { toolUses?: readonly WorkToolUse[] }
+
+/** A tool call in one line: the command or the file when it has one, else its input. */
+const callBrief = (use: WorkToolUse): string => {
+  const input = use.input ?? {}
+  const named = input.command ?? input.file_path ?? input.notebook_path
+  return `${use.tool}: ${clipEnd(typeof named === 'string' ? named.trim() : JSON.stringify(input), maxWorkCall)}`
+}
+
+/** One line or block of the work digest. `isCommit` for a shell call that committed, `isFailedShell` for one that failed. */
+export type WorkEntry = { text: string; isShell: boolean; isCommit: boolean; isFailedShell: boolean }
+
+/** What the digest keeps of a call's result: a failure and any result that cannot be had again, cut; of a shell output, the end. */
+const callOutcome = (use: WorkToolUse): string => {
+  const output = (use.text ?? '').trim()
+  if (use.isError === true) return `\nfailed: ${clipMiddle(output, maxWorkResult) || 'no output'}`
+  if (!output || repeatableTools.includes(use.tool)) return ''
+  return shellTools.includes(use.tool) ? `\noutput ends: ${output.slice(-maxWorkOutput)}` : `\nresult: ${clipMiddle(output, maxWorkResult)}`
+}
+
+/**
+ * The model's side of the conversation as short entries, oldest first: what it said, and each tool call with the text
+ * of a failure, the end of a shell output, or the start and end of a result that cannot be had again (a subagent's
+ * report, an answer from the user, a fetched page). The user's requests have their own part of the pointer, recorded by
+ * origin: a user message here may be a skill body or another plugin's prompt. The model's last message has its own
+ * part too, and the mark call says nothing the focus does not.
+ */
+export const workEntries = (messages: readonly WorkMessage[], toolName: string): WorkEntry[] => {
+  const replyIndex = lastReplyIndex(messages)
+  const entries: WorkEntry[] = []
+  // A line after the first is indented, so a reply or a result of several lines reads as one entry and never as a
+  // heading of the pointer.
+  const add = (text: string, flags: Omit<WorkEntry, 'text'>) => entries.push({ text: text.replace(/\n/g, '\n  '), ...flags })
+  messages.forEach((message, index) => {
+    if (message.role !== 'assistant') return
+    const text = (message.text ?? '').trim()
+    if (text && index !== replyIndex) add(`You: ${clipEnd(text, maxWorkReply)}`, { isShell: false, isCommit: false, isFailedShell: false })
+    for (const use of message.toolUses ?? []) {
+      if (use.tool === toolName) continue
+      const isShell = shellTools.includes(use.tool)
+      const isFailed = use.isError === true
+      add(`${callBrief(use)}${callOutcome(use)}`, {
+        isShell,
+        isCommit: !isFailed && isCommitCall(use.tool, use.input ?? {}) && committedLine.test(use.text ?? ''),
+        isFailedShell: isShell && isFailed,
+      })
+    }
+  })
+  return entries
+}
+
+/** The entries after the last commit, and whether there was one: what a commit holds needs no digest. */
+export const afterLastCommit = (entries: readonly WorkEntry[]): { entries: readonly WorkEntry[]; isCommitted: boolean } => {
+  let commitIndex = -1
+  entries.forEach((entry, index) => {
+    if (entry.isCommit) commitIndex = index
+  })
+  return { entries: entries.slice(commitIndex + 1), isCommitted: commitIndex >= 0 }
+}
+
+/**
+ * The work part of the pointer: the newest entries after the last commit, up to maxWork characters. A focus written
+ * at a clean boundary has little after the commit, so the part is short; work that was never committed is what only
+ * the conversation held, and it gets the room.
+ */
+export const workText = (messages: readonly WorkMessage[], toolName: string): string => {
+  const work = afterLastCommit(workEntries(messages, toolName))
+  const heading = work.isCommitted ? '## Your work after the last commit' : '## Your work since the conversation started or was last compacted'
+  if (work.entries.length === 0) return `${heading}\nNothing but your last message.`
+  const kept: string[] = []
+  let size = 0
+  for (const entry of [...work.entries].reverse()) {
+    size += entry.text.length
+    if (size > maxWork && kept.length > 0) break
+    kept.unshift(entry.text)
+  }
+  const cut = work.entries.length - kept.length
+  return [
+    heading,
+    'A digest the plugin made, oldest first: what you said, each tool call, the end of a shell output, the text of a failure and the start and end of other results. Results of file reads, searches and edits are left out.',
+    ...(cut > 0 ? [`... ${cut} earlier ${cut === 1 ? 'entry' : 'entries'} cut; search the transcript for them`] : []),
+    ...kept,
+  ].join('\n')
+}
+
+/** The work part for the pointer; a failure to make it (a message of an unexpected shape) must not cost the pointer. */
+export const workPart = (messages: readonly WorkMessage[], toolName: string): string => {
+  try {
+    return workText(messages, toolName)
+  } catch (error) {
+    return `## Your work after the last commit\nNot available: the plugin could not read the conversation (${error instanceof Error ? error.message : String(error)}). Search the transcript.`
+  }
+}
+
+/**
+ * What the mark tool adds to its answer in pointer mode, while the model still has the conversation: a pointer is only
+ * as good as its focus, and nothing after the compaction can ask for a better one. A second call replaces the mark, so
+ * the advice says to repeat the other inputs.
+ */
+export const pointerAdvice = (current: Mark, messages: readonly WorkMessage[], toolName: string): string[] => {
+  if (current.state !== 'boundary') return []
+  if (!current.focus) return ['Pointer mode: the mark has no focus, so the plugin will make a summary instead of a pointer. For a pointer, call again with a focus.']
+  const advice: string[] = []
+  if (current.focus.length < minFocus)
+    advice.push(
+      `Pointer mode: the focus is ${current.focus.length} characters, and it is all the next context gets from you about the goal, what is done, the next step, open decisions and what you ruled out. If it leaves one of those out, call again before you end the turn, with a fuller focus and \`resume\` and \`userSteps\` as you gave them: a new call replaces the mark.`,
+    )
+  const lastShell = afterLastCommit(workEntries(messages, toolName)).entries.filter(entry => entry.isShell).at(-1)
+  if (lastShell?.isFailedShell)
+    advice.push(
+      `Pointer mode: your last shell command failed and nothing was committed after it (${clipEnd(lastShell.text.split('\n')[0] ?? '', 120)}). The pointer keeps a digest of that work, not the full output. If the step is unfinished, call again with \`busy\` and go on with it; if it is finished, make sure the focus says what failed and why it no longer matters.`,
+    )
+  return advice
+}
+
 /** The one user message that replaces the conversation in pointer mode. Its first line labels it, as summaryLabel does a summary. */
-export const pointerText = (parts: PointerParts, reply: string) =>
+export const pointerText = (parts: PointerParts, reply: string, work: string) =>
   [
     `Compacted by the compact-timing plugin at ${thousands(parts.tokens)} tokens, at a \`boundary\` mark, in pointer mode: this message replaced the conversation, and no summary was made.`,
-    'compact-timing: an automatic message from a plugin, not written by the user. You wrote the focus, the open steps and the last message; the plugin added the user\'s requests, the files written, the transcript path and the commits.',
+    'compact-timing: an automatic message from a plugin, not written by the user. You wrote the focus, the open steps and the last message; the plugin added the user\'s requests, the digest of your work, the files written, the transcript path and the commits.',
     `## Focus\n${parts.focus || 'None given.'}`,
     `## The user's requests\nVerbatim, oldest first; a later request can change an earlier one.\n${parts.requests}`,
     `## Open steps you gave the user\n${parts.userSteps || 'None listed.'}`,
+    work,
     `## Your last message\n${reply || 'None found.'}`,
     `## Files written this session with Write, Edit or NotebookEdit\nFiles changed through Bash are not listed.\n${parts.files}`,
-    `## Transcript\n${parts.transcriptPath}\nFor anything else from the conversation (requests left out above, error text, paths, numbers), ${transcriptSearchHow} Search it before asking the user for something they may already have given.`,
+    `## Transcript\n${parts.transcriptPath}\nFor anything else from the conversation (requests left out above, error text, paths, numbers), ${transcriptSearchHow} Search it before asking the user for something they may already have given, and before acting on a command, an error or a value the focus names without giving it exactly.`,
     `## Commits\n${parts.commits}`,
   ].join('\n\n')
 
@@ -396,10 +553,22 @@ export const register: Register = (on, options) => {
       const input = e as unknown as { state?: unknown; focus?: unknown; resume?: unknown; userSteps?: unknown }
       const parsed = parseMark(isPointerMode ? input : { ...input, userSteps: undefined })
       if (!parsed) return { result: 'The mark was not set: state must be `boundary` or `busy`.' }
-      const tokens = parsed.resume ? await $.session.usage().then(usage => usage.context.tokens).catch(() => undefined) : undefined
+      const isPointerMark = isPointerMode && parsed.state === 'boundary'
+      const tokens = parsed.resume || isPointerMark ? await $.session.usage().then(usage => usage.context.tokens).catch(() => undefined) : undefined
       const stored = armedMark(parsed, tokens, limits)
       await update($, mark, () => stored)
-      return { result: markResult(parsed, tokens, limits) }
+      // Only when this mark can compact: below boundaryTokens, or at an unknown size, no pointer is made and the
+      // advice would be noise. The mark is stored by now, so a failure here must not fail the call.
+      let advice: string[] = []
+      if (isPointerMark && tokens !== undefined && tokens >= limits.boundaryTokens) {
+        try {
+          // Without a focus the advice needs no messages.
+          advice = pointerAdvice(parsed, parsed.focus ? await $.session.messages() : [], markTool)
+        } catch {
+          advice = []
+        }
+      }
+      return { result: [markResult(parsed, tokens, limits), ...advice].join('\n') }
     }
     const result = await next(e)
     if (e.agentId !== undefined || result.deny !== undefined || result.isError) return result
@@ -407,15 +576,15 @@ export const register: Register = (on, options) => {
       const written = writtenPath(e.tool, e as unknown as Record<string, unknown>)
       if (written !== null) await update($, sessionRecord, previous => addFile(previous, written)).catch(() => undefined)
     }
-    const isCommitCall = e.tool === 'Bash' && isCommit((e as unknown as { command: string }).command)
+    const isCommitting = isCommitCall(e.tool, e as unknown as Record<string, unknown>)
     const isNudged = await read($, nudged).catch(() => true)
-    if (!isCommitCall && isNudged) return result
+    if (!isCommitting && isNudged) return result
     const [current, tokens] = await Promise.all([
       read($, mark).catch(() => null),
       $.session.usage().then(usage => usage.context.tokens).catch(() => undefined),
     ])
     const context: string[] = []
-    const isReminded = isCommitCall && shouldRemind(current, tokens, limits)
+    const isReminded = isCommitting && shouldRemind(current, tokens, limits)
     if (isReminded) context.push(commitReminder(markTool, current))
     if (tokens !== undefined && shouldNudge(current, tokens, isNudged, limits)) {
       // Decided inside the write: tool hooks of parallel calls run at the same time, and only one may send the nudge.
@@ -559,7 +728,7 @@ export const register: Register = (on, options) => {
     let pointed: SessionCompactResult | null = null
     if (isPointerMode && e.agentId === undefined && e.trigger === 'manual') {
       const [own, parts] = await Promise.all([read($, ownCompact).catch(() => null), read($, pointer).catch(() => null)])
-      if (own === 'pending' && parts) pointed = { messages: [{ role: 'user', text: pointerText(parts, lastReply(e.messages)), toolUses: [] }] }
+      if (own === 'pending' && parts) pointed = { messages: [{ role: 'user', text: pointerText(parts, lastReply(e.messages), workPart(e.messages, markTool)), toolUses: [] }] }
     }
     // Another plugin's direct compaction carries its own instructions. This plugin's runs as `/compact` (`manual`).
     if (pointed === null && e.agentId === undefined && e.trigger !== 'plugin') {
