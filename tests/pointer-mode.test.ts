@@ -11,6 +11,7 @@ import {
   emptyRecord,
   filesText,
   isCommitCall,
+  isCommitLogged,
   isQuietCommit,
   isRemindableCommit,
   lastFailedShell,
@@ -20,6 +21,7 @@ import {
   parseMark,
   pointerAdvice,
   pointerText,
+  reflogArguments,
   requestsText,
   resumePrompt,
   ruleText,
@@ -292,7 +294,7 @@ test('the work entries hold what was said and each tool call, without the mark, 
   expect(afterLastCommit(entries.slice(3)).isCommitted).toBe(false)
 })
 
-test('only a command that printed git\'s commit line counts as a commit', () => {
+test('without the reflog, only a command that printed git\'s commit line counts as a commit', () => {
   const committed = (command: string, text: string | undefined, isError = false) =>
     workEntries([{ role: 'assistant', text: '', toolUses: [{ tool: 'Bash', input: { command }, ...(text === undefined ? {} : { text }), ...(isError ? { isError: true as const } : {}) }] }], markTool)[0]?.isCommit
   expect(committed('git commit -m x', '[main 5815a99] x\n 1 file changed')).toBe(true)
@@ -304,6 +306,59 @@ test('only a command that printed git\'s commit line counts as a commit', () => 
   expect(committed('echo "then run git commit"', 'then run git commit')).toBe(false)
   expect(committed('git commit -m x', undefined)).toBe(false)
   expect(committed('git commit -m x', '[main 5815a99] x', true)).toBe(false)
+  // A quiet commit prints no such line.
+  expect(committed('git commit -qm x && git log --oneline -1', '5815a99 x')).toBe(false)
+})
+
+test('a call whose commit the reflog showed counts when its command holds a commit and it did not fail', () => {
+  const use = (id: string, command: string, isError = false) => ({ tool_use_id: id, ...shell(command, '(Bash completed with no output)', isError) })
+  const entries = workEntries(
+    [
+      {
+        role: 'assistant',
+        text: '',
+        toolUses: [
+          use('toolu_quiet', 'git commit -qm x'),
+          use('toolu_other', 'git commit -qm y'),
+          use('toolu_failed', 'git commit -qm z && bun test', true),
+          use('toolu_build', 'make build'),
+        ],
+      },
+    ],
+    markTool,
+    ['toolu_quiet', 'toolu_failed', 'toolu_build'],
+  )
+  expect(entries.map(entry => entry.isCommit)).toEqual([true, false, false, false])
+  // Without the list, or with a use that has no id, the output decides as before.
+  expect(workEntries([{ role: 'assistant', text: '', toolUses: [use('toolu_quiet', 'git commit -qm x')] }], markTool)[0]?.isCommit).toBe(false)
+  expect(workEntries([{ role: 'assistant', text: '', toolUses: [shell('git commit -qm x', '')] }], markTool, ['toolu_quiet'])[0]?.isCommit).toBe(false)
+})
+
+// A line of `git reflog --date=unix --format=%gd%x09%gs`, made now unless a time is given.
+const entry = (subject: string, time = Math.floor(Date.now() / 1000)) => `HEAD@{${time}}\t${subject}`
+
+test('HEAD\'s reflog shows a commit made during the call, and only a commit', () => {
+  const callStart = 1762934400_500
+  const callEnd = 1762934402_500
+  const logged = (entries: string[], exitCode = 0) => isCommitLogged({ exitCode, stdout: `${entries.join('\n')}\n` }, callStart, callEnd)
+  expect(reflogArguments).toEqual(['reflog', '-n', '20', '--no-show-signature', '--date=unix', '--format=%gd%x09%gs'])
+  expect(logged([entry('commit: Fix the parser', 1762934401)])).toBe(true)
+  for (const kind of ['amend', 'initial', 'merge', 'cherry-pick', 'rebase']) expect(logged([entry(`commit (${kind}): Fix the parser`, 1762934401)])).toBe(true)
+  // Git keeps whole seconds, so a commit in the second the call started or ended counts.
+  expect(logged([entry('commit: Fix the parser', 1762934400)])).toBe(true)
+  expect(logged([entry('commit: Fix the parser', 1762934402)])).toBe(true)
+  // A commit followed by a checkout in the same command.
+  expect(logged([entry('checkout: moving from fix to main', 1762934401), entry('commit: Fix the parser', 1762934401)])).toBe(true)
+  // A commit before the call, one dated after it (a date set ahead, a clock running fast), and what other commands write.
+  expect(logged([entry('commit: Fix the parser', 1762934399)])).toBe(false)
+  expect(logged([entry('commit: Fix the parser', 1762934403)])).toBe(false)
+  expect(logged([entry('commit: Fix the parser', 1893456000)])).toBe(false)
+  const others = ['rebase (pick): Fix', 'cherry-pick: Fix', 'pull: Fast-forward', 'reset: moving to HEAD~1', 'checkout: moving from commit: to main', "merge fix: Merge made by the 'ort' strategy."]
+  expect(logged(others.map(subject => entry(subject, 1762934401)))).toBe(false)
+  // A failed read, no answer, no reflog.
+  expect(logged([entry('commit: Fix the parser', 1762934401)], 128)).toBe(false)
+  expect(isCommitLogged({ error: 'timed out' }, callStart, callEnd)).toBe(false)
+  expect(logged([])).toBe(false)
 })
 
 test('a result that cannot be had again is kept, cut; lines after the first are indented', () => {
@@ -432,8 +487,18 @@ test('the resume prompt after a pointer does not speak of a summary', () => {
   expect(resumePrompt('Next: step 3.')).toContain('The summary is newer than this focus')
 })
 
+const isReflogRead = (args: readonly string[]) => args[1] === 'reflog'
+
 type Seen = { summarized: string[]; instructions: string[]; installed: string[]; prompts: string[]; gitArgs: string[][]; logs: string[] }
-type Overrides = { toolCall?: (input: Record<string, unknown>) => unknown; isRepository?: boolean; hasCommits?: boolean }
+type Overrides = {
+  toolCall?: (input: Record<string, unknown>) => unknown
+  isRepository?: boolean
+  hasCommits?: boolean
+  // HEAD's reflog, newest first, as `git reflog` prints it; the function throws for a git that does not answer.
+  reflog?: () => readonly string[]
+  // The conversation the plugin's compaction replaces.
+  messages?: unknown[]
+}
 
 /**
  * The world beneath the plugin: the session size, git, and `/compact`, whose command runs the compaction with the
@@ -463,7 +528,8 @@ const world = (on: On, $: Engine, tokens = 250_000, overrides: Overrides = {}): 
     // A repository without a commit: the log fails, the status answers.
     if (overrides.hasCommits === false && !isStatus)
       return { value: { exitCode: 128, stdout: '', stderr: "fatal: your current branch 'main' does not have any commits yet\n", isStdoutTruncated: false, isStderrTruncated: false } } as never
-    const stdout = isStatus ? ' M src/lex.ts\n?? notes.md\n' : 'abc123 2026-11-12 09:00 Fix the parser\n'
+    const reflog = () => `${(overrides.reflog?.() ?? [entry('commit (initial): Start', 1762934400)]).join('\n')}\n`
+    const stdout = isStatus ? ' M src/lex.ts\n?? notes.md\n' : isReflogRead(e.argv) ? reflog() : 'abc123 2026-11-12 09:00 Fix the parser\n'
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } as never
   })
   on('session.compact', (_, e) => {
@@ -476,7 +542,7 @@ const world = (on: On, $: Engine, tokens = 250_000, overrides: Overrides = {}): 
       const result = await $.session.compact({
         trigger: 'manual',
         instructions: e.args,
-        messages: [
+        messages: overrides.messages ?? [
           { role: 'user', text: 'Fix the parser', toolUses: [] },
           { role: 'assistant', text: 'Fixed and committed. Please run `make deploy`.', toolUses: [] },
         ],
@@ -558,7 +624,7 @@ test('the commit reminder follows a command that committed, not one that names a
     'git commit -qm z': '',
   }
   // The last command stands for a call another plugin's hook answered, which has no output text.
-  world(on, $, 250_000, { toolCall: input => (input.command === 'git commit -m y' ? { result: 'ok' } : { result: 'ok', text: outputs[String(input.command)] }) })
+  const seen = world(on, $, 250_000, { toolCall: input => (input.command === 'git commit -m y' ? { result: 'ok' } : { result: 'ok', text: outputs[String(input.command)] }) })
   await start($)
   const context = async (command: string) => ((await $.tool.call({ tool: 'Bash', command } as never)) as { context?: string[] }).context ?? []
   expect((await context('git commit -m x'))[0]).toContain('this commit saved work outside the conversation')
@@ -568,6 +634,152 @@ test('the commit reminder follows a command that committed, not one that names a
   // Under a busy mark the words are enough, and the reminder asks whether the step is done.
   await setMark($, { state: 'busy' })
   expect((await context('echo "then run git commit"'))[0]).toContain('the mark is `busy`')
+  // Without pointer mode the reflog is not read.
+  expect(seen.gitArgs).toEqual([])
+})
+
+/**
+ * A session in pointer mode whose commands write to HEAD's reflog what `commits` gives them, oldest first. What a call
+ * wrote is dated now while it runs and in the past once the next call starts, as for calls some seconds apart.
+ * `compact` replaces the conversation with the given messages, which `use` builds with the ids the calls were given.
+ */
+const reflogWorld = (on: On, $: Engine, overrides: { commits: Record<string, string[]>; answer?: () => boolean; result?: (command: string) => unknown }) => {
+  const older = [entry('commit (initial): Start', 1762934400)]
+  let latest: string[] = []
+  const ids: Record<string, string> = {}
+  const messages: unknown[] = []
+  const seen = world(on, $, 250_000, {
+    reflog: () => {
+      if (overrides.answer?.() === false) throw new Error('timed out')
+      return [...latest.map(subject => entry(subject)), ...older]
+    },
+    messages,
+    toolCall: input => {
+      const command = String(input.command)
+      ids[command] = String(input.tool_use_id)
+      older.unshift(...latest.map(subject => entry(subject, 1762934400)))
+      latest = [...(overrides.commits[command] ?? [])].reverse()
+      return overrides.result?.(command) ?? { result: 'ok', text: '' }
+    },
+  })
+  const run = (command: string, extra: Record<string, unknown> = {}) => $.tool.call({ tool: 'Bash', command, ...extra } as never)
+  const use = (command: string, text = '', isError = false) => ({ tool_use_id: ids[command], ...shell(command, text, isError) })
+  const compact = async (...conversation: unknown[]) => {
+    messages.push(...conversation)
+    await setMark($, { state: 'boundary', focus: 'Next: the lexer.' })
+    await endTurn($)
+    return seen.installed[0] ?? ''
+  }
+  return { seen, run, use, compact }
+}
+
+test('pointer mode: a quiet commit in HEAD\'s reflog starts the digest after it, one a hook rejected does not', { options: { pointerMode: true } }, async ($, on) => {
+  const quiet = 'git commit -qm "Fix the parser" && git checkout -q main'
+  const rejected = 'git commit -q -m "Fix the lexer"; git log --oneline -1'
+  const session = reflogWorld(on, $, { commits: { [quiet]: ['commit: Fix the parser', 'checkout: moving from fix to main'] } })
+  await start($)
+  await session.run(quiet)
+  await session.run('bun test')
+  await session.run(rejected)
+  // One read after each commit command, none for the test run.
+  expect(session.seen.gitArgs.filter(isReflogRead)).toEqual([
+    ['git', ...reflogArguments],
+    ['git', ...reflogArguments],
+  ])
+  const pointer = await session.compact(
+    { role: 'user', text: 'Fix the parser', toolUses: [] },
+    { role: 'assistant', text: 'Fixing the parser.', toolUses: [session.use(quiet, '(Bash completed with no output)')] },
+    { role: 'assistant', text: 'Now the lexer.', toolUses: [session.use('bun test', '1 fail')] },
+    { role: 'assistant', text: 'Committing the lexer.', toolUses: [session.use(rejected, 'lint failed\nbbbbbbb Fix the parser')] },
+    { role: 'assistant', text: 'The lexer commit was rejected.', toolUses: [] },
+  )
+  expect(pointer).toContain('## Your work after the last commit\nA digest the plugin made')
+  expect(pointer).not.toContain('Fixing the parser.')
+  expect(pointer).toContain('You: Now the lexer.')
+  expect(pointer).toContain('lint failed')
+})
+
+test('pointer mode: the reflog finds no commit for a rebase, no answer, a failed, denied or background call, or a subagent', { options: { pointerMode: true } }, async ($, on) => {
+  let isAnswering = true
+  const commands = {
+    rebase: 'git commit -qm x; git pull --rebase',
+    slow: 'git commit -qm slow',
+    failed: 'git commit -qm x && bun test',
+    denied: 'git commit -qm denied',
+    background: 'git commit -qm background',
+  }
+  const session = reflogWorld(on, $, {
+    commits: {
+      [commands.rebase]: ['pull --rebase (start): checkout origin/main', 'rebase (pick): Fix', 'rebase (finish): returning to refs/heads/main'],
+      [commands.slow]: ['commit: slow'],
+      [commands.failed]: ['commit: x'],
+      [commands.denied]: ['commit: denied'],
+      [commands.background]: ['commit: background'],
+      'git commit -qm subagent': ['commit: subagent'],
+    },
+    answer: () => isAnswering,
+    result: command => (command === commands.failed ? { result: 'x', text: '1 fail', isError: true } : command === commands.denied ? { deny: 'not allowed' } : undefined),
+  })
+  await start($)
+  await session.run(commands.rebase)
+  isAnswering = false
+  await session.run(commands.slow)
+  isAnswering = true
+  expect(session.seen.gitArgs.filter(isReflogRead).length).toBe(2)
+  // Not read after a failed call, a denied one, one run in the background, or a subagent's.
+  await session.run(commands.failed)
+  await session.run(commands.denied)
+  await session.run(commands.background, { run_in_background: true })
+  await session.run('git commit -qm subagent', { agentId: 'a1' })
+  expect(session.seen.gitArgs.filter(isReflogRead).length).toBe(2)
+  const pointer = await session.compact(
+    { role: 'assistant', text: 'Committing.', toolUses: Object.values(commands).map(command => session.use(command, '', command === commands.failed)) },
+    { role: 'assistant', text: 'Done.', toolUses: [] },
+  )
+  expect(pointer).toContain('## Your work since the conversation started or was last compacted\n')
+  expect(pointer).toContain('You: Committing.')
+})
+
+test('pointer mode: a /clear empties the record of commits', { options: { pointerMode: true } }, async ($, on) => {
+  const before = 'git commit -qm before'
+  const after = 'git commit -qm after'
+  const session = reflogWorld(on, $, { commits: { [before]: ['commit: before'], [after]: ['commit: after'] } })
+  await start($)
+  await session.run(before)
+  await $.session.end({ reason: 'clear', sessionId: 's1' } as never)
+  await session.run(after)
+  // The commit after the /clear counts; the one before it no longer does, so the digest starts after the first.
+  const pointer = await session.compact(
+    { role: 'assistant', text: 'Committing.', toolUses: [session.use(after), session.use(before)] },
+    { role: 'assistant', text: 'Done.', toolUses: [] },
+  )
+  expect(pointer).toContain(`## Your work after the last commit\nA digest the plugin made, oldest first: what you said, each tool call, the end of a shell output, the text of a failure and the start and end of other results. Results of file reads, searches and edits are left out.\nBash: ${before}`)
+})
+
+test('pointer mode: the record of commits keeps the newest 200', { options: { pointerMode: true } }, async ($, on) => {
+  const commands = Array.from({ length: 201 }, (_, index) => `git commit -qm c${index}`)
+  const session = reflogWorld(on, $, { commits: Object.fromEntries(commands.map(command => [command, [`commit: ${command}`]])) })
+  await start($)
+  for (const command of commands) await session.run(command)
+  // The 200th newest still counts and the first fell out, so the digest starts after the 200th newest and holds the
+  // first. With a smaller record neither would count; with no limit the digest would start after the first.
+  const pointer = await session.compact(
+    { role: 'assistant', text: 'Committing.', toolUses: [session.use(commands[1] ?? ''), session.use(commands[0] ?? '')] },
+    { role: 'assistant', text: 'Done.', toolUses: [] },
+  )
+  expect(pointer).toContain('## Your work after the last commit\n')
+  expect(pointer).toContain(`Bash: ${commands[0]}`)
+})
+
+test('pointer mode: the reminder follows a commit whose own output was sent away when the reflog shows it', { options: { pointerMode: true } }, async ($, on) => {
+  const session = reflogWorld(on, $, {
+    commits: { 'git commit -m x >/dev/null && git log -1': ['commit: x'] },
+    result: () => ({ result: 'ok', text: 'commit 5815a99\nAuthor: Ada\n\n    x' }),
+  })
+  await start($)
+  const context = async (command: string) => ((await session.run(command)) as { context?: string[] }).context ?? []
+  expect((await context('git commit -m x >/dev/null && git log -1'))[0]).toContain('this commit saved work outside the conversation')
+  expect(await context('git commit -m y >/dev/null && git log -1')).toEqual([])
 })
 
 test('a summary of the main conversation is asked for the unfinished step, a subagent\'s is not', async ($, on) => {

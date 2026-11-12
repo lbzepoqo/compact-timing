@@ -33,6 +33,12 @@ const transcriptPath = atom({ plugin: 'compact-timing', key: 'transcriptPath' } 
 export type SessionRecord = State['sessionRecord']
 export const emptyRecord: SessionRecord = { requests: [], omittedRequests: 0, files: [], omittedFiles: 0 }
 const sessionRecord = atom({ plugin: 'compact-timing', key: 'sessionRecord' } as const, emptyRecord)
+// Pointer mode: the ids of the main agent's shell calls that made a commit by HEAD's reflog (`isCommitLogged`), newest
+// last, so the work digest finds a quiet commit. A `/clear` starts it over.
+const commitCalls = atom({ plugin: 'compact-timing', key: 'commitCalls' } as const, [] as string[])
+const maxCommitCalls = 200
+// The reflog read runs after the call, before its result goes back to the model.
+const reflogTimeout = 3000
 
 /** The tool input as the model sends it, or null when the state is not one of the two. */
 export const parseMark = (input: { state?: unknown; focus?: unknown; resume?: unknown; userSteps?: unknown }): Mark | null => {
@@ -182,10 +188,40 @@ export const isQuietCommit = (command: string) => quietCommitPattern.test(comman
 
 /**
  * The line git prints for a commit it made: `[main 5815a99] Fix the parser`. A command that only names a commit (an
- * echo, a dry run) or hides its failure behind a pipe prints none. One whose output is cut or quiet is missed by the
- * work digest, which only makes the digest longer.
+ * echo, a dry run) or hides its failure behind a pipe prints none, and neither does a quiet one (`-q`), which pointer
+ * mode finds in HEAD's reflog (`isCommitLogged`).
  */
 const committedLine = /^\[[^\]\n]+ [0-9a-f]{7,40}\] /m
+
+/**
+ * The newest entries of HEAD's reflog in the session's folder, each the time in seconds and what moved HEAD:
+ * `HEAD@{1762934400}<tab>commit: Fix the parser`. A worktree has its own. `--no-show-signature`: a `log.showSignature`
+ * setting would print a signature check above each entry.
+ */
+export const reflogArguments = ['reflog', '-n', '20', '--no-show-signature', '--date=unix', '--format=%gd%x09%gs']
+const reflogEntry = /^\S+@\{(\d+)\}\t(.*)$/
+// What `git commit` writes, in English whatever the language: `commit:`, or `commit (<kind>):` for an amend, a first
+// commit, or one that ends a merge, a cherry-pick or a rebase. A rebase, a cherry-pick, a pull, a checkout or a reset
+// writes its own name.
+const commitEntry = /^commit(?: \([a-z-]+\))?: /
+
+/**
+ * Whether HEAD's reflog has a commit made between `startedAt` and `endedAt`: how a quiet commit, which prints nothing
+ * that says so, is found, and a commit a hook rejected is not. A commit followed by a checkout in the same command
+ * still counts. Git keeps whole seconds, so a commit made earlier in the second the call started counts too. An entry
+ * dated after the read (a commit date set ahead, a clock running fast) is not from this call. A failed read concludes
+ * nothing.
+ */
+export const isCommitLogged = (run: { exitCode: number; stdout: string } | { error: string }, startedAt: number, endedAt: number): boolean => {
+  if ('error' in run || run.exitCode !== 0) return false
+  const since = Math.floor(startedAt / 1000)
+  const until = Math.floor(endedAt / 1000)
+  return run.stdout.split('\n').some(line => {
+    const entry = reflogEntry.exec(line.trimEnd())
+    const time = Number(entry?.[1])
+    return entry?.[2] !== undefined && time >= since && time <= until && commitEntry.test(entry[2])
+  })
+}
 
 // The lines that follow it, which are what is left when a pipe keeps only the end: ` 2 files changed, 3 insertions(+)`
 // and ` create mode 100644 a.ts`. A diff or a pull prints them too, so they count only for the reminder, where the
@@ -381,9 +417,21 @@ export const uncommittedText = (
 /** Whether a git run gave its answer. */
 const isGitAnswer = (run: { exitCode: number } | { error: string }) => 'exitCode' in run && run.exitCode === 0
 
-/** A git run that never throws: a git that cannot start or does not finish in time gives `{ error }`. */
-const runGit = ($: { process: { run: (argv: readonly string[], init?: ProcessRunInit) => Promise<ProcessRunResult> } }, gitArguments: readonly string[], init: ProcessRunInit) =>
-  $.process.run(['git', ...gitArguments], init).catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) }))
+/**
+ * A git run that never throws: a git that cannot start or does not finish in time gives `{ error }`, as does a host
+ * where `$.process` throws before it returns a promise.
+ */
+const runGit = async (
+  $: { process: { run: (argv: readonly string[], init?: ProcessRunInit) => Promise<ProcessRunResult> } },
+  gitArguments: readonly string[],
+  init: ProcessRunInit,
+): Promise<ProcessRunResult | { error: string }> => {
+  try {
+    return await $.process.run(['git', ...gitArguments], init)
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) }
+  }
+}
 
 /**
  * The model's last message with text: the mark is set inside a turn, so steps given to the user in the turn's closing
@@ -422,7 +470,7 @@ const clipMiddle = (text: string, limit: number) => {
   return `${text.slice(0, head)} ...(cut)... ${text.slice(-(limit - head))}`
 }
 
-type WorkToolUse = Pick<ToolUseSummary, 'tool' | 'input' | 'text' | 'isError'>
+type WorkToolUse = Pick<ToolUseSummary, 'tool' | 'input' | 'text' | 'isError'> & Partial<Pick<ToolUseSummary, 'tool_use_id'>>
 type WorkMessage = Pick<SessionMessage, 'role' | 'text'> & { toolUses?: readonly WorkToolUse[] }
 
 /** A tool call in one line: the command or the file when it has one, else its input. */
@@ -449,9 +497,14 @@ const callOutcome = (use: WorkToolUse): string => {
  * report, an answer from the user, a fetched page). The user's requests have their own part of the pointer, recorded by
  * origin: a user message here may be a skill body or another plugin's prompt. The model's last message has its own
  * part too, and the mark call says nothing the focus does not.
+ *
+ * A shell call committed when its command holds a `git commit`, it did not fail, and either its output has git's commit
+ * line or its id is one of `committedCallIds`, the calls whose commit HEAD's reflog shows (`isCommitLogged`). The words
+ * and a `-q` alone are not taken for a commit, as the reminder takes them: a wrong guess here drops work from the digest.
  */
-export const workEntries = (messages: readonly WorkMessage[], toolName: string): WorkEntry[] => {
+export const workEntries = (messages: readonly WorkMessage[], toolName: string, committedCallIds: readonly string[] = []): WorkEntry[] => {
   const replyIndex = lastReplyIndex(messages)
+  const logged = new Set(committedCallIds)
   const entries: WorkEntry[] = []
   // A line after the first is indented, so a reply or a result of several lines reads as one entry and never as a
   // heading of the pointer.
@@ -463,7 +516,10 @@ export const workEntries = (messages: readonly WorkMessage[], toolName: string):
     for (const use of message.toolUses ?? []) {
       if (use.tool === toolName) continue
       add(`${callBrief(use)}${callOutcome(use)}`, {
-        isCommit: use.isError !== true && isCommitCall(use.tool, use.input ?? {}) && committedLine.test(use.text ?? ''),
+        isCommit:
+          use.isError !== true &&
+          isCommitCall(use.tool, use.input ?? {}) &&
+          (committedLine.test(use.text ?? '') || (use.tool_use_id !== undefined && logged.has(use.tool_use_id))),
       })
     }
   })
@@ -484,8 +540,8 @@ export const afterLastCommit = (entries: readonly WorkEntry[]): { entries: reado
  * at a clean boundary has little after the commit, so the part is short; work that was never committed is what only
  * the conversation held, and it gets the room.
  */
-export const workText = (messages: readonly WorkMessage[], toolName: string): string => {
-  const work = afterLastCommit(workEntries(messages, toolName))
+export const workText = (messages: readonly WorkMessage[], toolName: string, committedCallIds: readonly string[] = []): string => {
+  const work = afterLastCommit(workEntries(messages, toolName, committedCallIds))
   const heading = work.isCommitted ? '## Your work after the last commit' : '## Your work since the conversation started or was last compacted'
   if (work.entries.length === 0) return `${heading}\nNothing but your last message.`
   const kept: string[] = []
@@ -505,9 +561,9 @@ export const workText = (messages: readonly WorkMessage[], toolName: string): st
 }
 
 /** The work part for the pointer; a failure to make it (a message of an unexpected shape) must not cost the pointer. */
-export const workPart = (messages: readonly WorkMessage[], toolName: string): string => {
+export const workPart = (messages: readonly WorkMessage[], toolName: string, committedCallIds: readonly string[] = []): string => {
   try {
-    return workText(messages, toolName)
+    return workText(messages, toolName, committedCallIds)
   } catch (error) {
     return `## Your work after the last commit\nNot available: the plugin could not read the conversation (${error instanceof Error ? error.message : String(error)}). Search the transcript.`
   }
@@ -671,7 +727,10 @@ export const register: Register = (on, options) => {
     })
     // A `/clear` ends the conversation and no `session.start` follows, so the record of the old one is dropped here.
     on('session.end', async ($, e, next) => {
-      if (e.reason === 'clear') await update($, sessionRecord, () => emptyRecord).catch(() => undefined)
+      if (e.reason === 'clear') {
+        await update($, sessionRecord, () => emptyRecord).catch(() => undefined)
+        await update($, commitCalls, () => []).catch(() => undefined)
+      }
       return next(e)
     })
   }
@@ -699,21 +758,33 @@ export const register: Register = (on, options) => {
       }
       return { result: [markResult(parsed, tokens, limits), ...advice].join('\n') }
     }
-    const result = await next(e)
-    if (e.agentId !== undefined || result.deny !== undefined || result.isError) return result
-    if (isPointerMode) {
-      const written = writtenPath(e.tool, e as unknown as Record<string, unknown>)
-      if (written !== null) await update($, sessionRecord, previous => addFile(previous, written)).catch(() => undefined)
-    }
     const input = e as unknown as Record<string, unknown>
     const isCommitCommand = isCommitCall(e.tool, input)
+    // Taken before the hooks beneath and the permission prompt, so the window includes the wait for approval.
+    const startedAt = Date.now()
+    const result = await next(e)
+    if (e.agentId !== undefined || result.deny !== undefined || result.isError) return result
+    // Pointer mode: whether the main agent's commit command made a commit, for the work digest. A call run in the
+    // background has only started by now.
+    const isCommitMade =
+      isPointerMode &&
+      isCommitCommand &&
+      input.run_in_background !== true &&
+      isCommitLogged(await runGit($, reflogArguments, { timeoutMs: reflogTimeout }), startedAt, Date.now())
+    if (isCommitMade)
+      await update($, commitCalls, previous => [...(Array.isArray(previous) ? previous : []), e.tool_use_id].slice(-maxCommitCalls)).catch(() => undefined)
+    if (isPointerMode) {
+      const written = writtenPath(e.tool, input)
+      if (written !== null) await update($, sessionRecord, previous => addFile(previous, written)).catch(() => undefined)
+    }
     const isNudged = await read($, nudged).catch(() => true)
     if (!isCommitCommand && isNudged) return result
     const [current, tokens] = await Promise.all([
       read($, mark).catch(() => null),
       $.session.usage().then(usage => usage.context.tokens).catch(() => undefined),
     ])
-    const isCommitting = isRemindableCommit(e.tool, input, result.text, current)
+    // The reflog is read only in pointer mode, where it also catches a commit whose own output was sent away.
+    const isCommitting = isCommitMade || isRemindableCommit(e.tool, input, result.text, current)
     const context: string[] = []
     const isReminded = isCommitting && shouldRemind(current, tokens, limits)
     if (isReminded) context.push(commitReminder(markTool, current))
@@ -866,8 +937,15 @@ export const register: Register = (on, options) => {
     // other compaction (a typed `/compact`, Claude Code's own, a subagent's) goes on to the summarizer.
     let pointed: SessionCompactResult | null = null
     if (isPointerMode && e.agentId === undefined && e.trigger === 'manual') {
-      const [own, parts] = await Promise.all([read($, ownCompact).catch(() => null), read($, pointer).catch(() => null)])
-      if (own === 'pending' && parts) pointed = { messages: [{ role: 'user', text: pointerText(parts, lastReply(e.messages), workPart(e.messages, markTool)), toolUses: [] }] }
+      const [own, parts, commits] = await Promise.all([
+        read($, ownCompact).catch(() => null),
+        read($, pointer).catch(() => null),
+        read($, commitCalls).catch(() => []),
+      ])
+      // A stored value of another shape finds no commit by the reflog rather than costing the digest.
+      const committed = Array.isArray(commits) ? commits.filter(id => typeof id === 'string') : []
+      if (own === 'pending' && parts)
+        pointed = { messages: [{ role: 'user', text: pointerText(parts, lastReply(e.messages), workPart(e.messages, markTool, committed)), toolUses: [] }] }
     }
     // Another plugin's direct compaction carries its own instructions. This plugin's runs as `/compact` (`manual`).
     if (pointed === null && e.agentId === undefined && e.trigger !== 'plugin') {
