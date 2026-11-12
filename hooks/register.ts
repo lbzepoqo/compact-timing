@@ -210,17 +210,110 @@ const commitEntry = /^commit(?: \([a-z-]+\))?: /
  * that says so, is found, and a commit a hook rejected is not. A commit followed by a checkout in the same command
  * still counts. Git keeps whole seconds, so a commit made earlier in the second the call started counts too. An entry
  * dated after the read (a commit date set ahead, a clock running fast) is not from this call. A failed read concludes
- * nothing.
+ * nothing. With `command`, the commit's subject must also be in the command's text (`isSubjectIn`).
  */
-export const isCommitLogged = (run: { exitCode: number; stdout: string } | { error: string }, startedAt: number, endedAt: number): boolean => {
+export const isCommitLogged = (
+  run: { exitCode: number; stdout: string } | { error: string },
+  startedAt: number,
+  endedAt: number,
+  command?: string,
+): boolean => {
   if ('error' in run || run.exitCode !== 0) return false
   const since = Math.floor(startedAt / 1000)
   const until = Math.floor(endedAt / 1000)
   return run.stdout.split('\n').some(line => {
     const entry = reflogEntry.exec(line.trimEnd())
     const time = Number(entry?.[1])
-    return entry?.[2] !== undefined && time >= since && time <= until && commitEntry.test(entry[2])
+    const subject = entry?.[2]
+    if (subject === undefined || time < since || time > until || !commitEntry.test(subject)) return false
+    return command === undefined || isSubjectIn(subject.replace(commitEntry, ''), command)
   })
+}
+
+// Letters and digits only, each run of anything else one space, so quoting and escaping do not count.
+const words = (text: string) => ` ${text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()} `
+
+/**
+ * Whether a commit's subject is in a command's text, word for word: a commit in another worktree is this command's
+ * only when its message came from the command (`-m`, or a heredoc for `-F -`). A commit another session made there at
+ * the same moment has its own subject. A message read from a file, and `--amend --no-edit`, are not in the command.
+ */
+const isSubjectIn = (subject: string, command: string) => {
+  const subjectWords = words(subject)
+  return subjectWords.trim() !== '' && words(command).includes(subjectWords)
+}
+
+/** The worktrees of the session folder's repository, one `worktree <path>` line each, the session folder's own too. */
+export const worktreeListArguments = ['worktree', 'list', '--porcelain']
+
+/** The paths in `git worktree list --porcelain`. A path git had to quote (it holds a newline or a quote) is left out. */
+export const worktreePaths = (stdout: string): string[] =>
+  stdout
+    .split('\n')
+    .filter(line => line.startsWith('worktree ') && !line.startsWith('worktree "'))
+    .map(line => line.slice('worktree '.length).trimEnd())
+    .filter(path => path !== '')
+
+// The most worktrees whose reflog one command reads, each with the reflog's time limit.
+const maxWorktreeReads = 4
+const drivePath = /^([A-Za-z]):\/(.*)$/
+const withSlashes = (path: string) => path.replace(/\\/g, '/').replace(/(?<=.)\/+$/, '')
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// A Windows path compares without case, so `c:/Users` is `C:/Users`.
+const isInside = (path: string, folder: string) => {
+  const [inner, outer] = drivePath.test(folder) ? [path.toLowerCase(), folder.toLowerCase()] : [path, folder]
+  return inner === outer || inner.startsWith(outer.endsWith('/') ? outer : `${outer}/`)
+}
+
+/**
+ * How a shell command can spell a folder: its full path, on Windows also as Git Bash and WSL write it (`/c/Users/...`,
+ * `/mnt/c/Users/...`), and under the home folder with `~` or `$HOME`. A path relative to the session folder (`../fix`)
+ * is not one of them: it was 3 of about 600 commit commands that moved to another folder in my transcripts.
+ */
+const pathSpellings = (path: string, home: string | undefined): string[] => {
+  const spellings = [path]
+  const drive = drivePath.exec(path)
+  if (drive) spellings.push(`/${drive[1]?.toLowerCase()}/${drive[2]}`, `/mnt/${drive[1]?.toLowerCase()}/${drive[2]}`)
+  const homeFolder = home ? withSlashes(home) : ''
+  if (homeFolder !== '' && homeFolder !== '/' && path.length > homeFolder.length && isInside(path, homeFolder)) {
+    const rest = path.slice(homeFolder.length + 1)
+    spellings.push(`~/${rest}`, `$HOME/${rest}`, `\${HOME}/${rest}`)
+  }
+  return spellings
+}
+
+/** Whether a command could name a folder as `namedWorktrees` reads it: without one, the worktrees are not listed. */
+export const mayNamePath = (command: string) => /[/\\~]|\$\{?HOME\b/.test(command)
+
+/**
+ * The worktrees, other than the one that holds the session folder, whose path `command` names: where a commit made
+ * after a `cd` or a `git -C` into another worktree is looked for, since each worktree has its own HEAD reflog. A
+ * worktree the command does not name is never read. A path counts where it stands alone or is followed by a folder in
+ * it (`/repo/src`), whatever the command does with it; the longest paths are matched first, so a worktree inside
+ * another (`/repo/.claude/worktrees/fix`) does not also name `/repo`. They come in the order the command names them.
+ */
+export const namedWorktrees = (command: string, paths: readonly string[], cwd: string, home: string | undefined): string[] => {
+  const folders = [...new Set(paths.map(withSlashes))].sort((first, second) => second.length - first.length)
+  const sessionFolder = withSlashes(cwd)
+  const own = folders.find(folder => sessionFolder !== '' && isInside(sessionFolder, folder))
+  // Doubled backslashes, as an escaped Windows path has them, are one separator.
+  let rest = command.replace(/\\+/g, '/')
+  const firstNamed = new Map<string, number>()
+  for (const folder of folders) {
+    for (const spelling of pathSpellings(folder, home)) {
+      const pattern = new RegExp(`(^|[\\s'"=(;&|\`])${escapeRegExp(spelling)}(?=$|[\\s'"/;&|)\`])`, drivePath.test(folder) ? 'gi' : 'g')
+      // Replaced by as many characters, so the places of later matches stay where they were.
+      rest = rest.replace(pattern, (_, before: string, offset: number) => {
+        if (folder !== own) firstNamed.set(folder, Math.min(firstNamed.get(folder) ?? offset, offset))
+        return `${before}${'\u0000'.repeat(spelling.length)}`
+      })
+    }
+  }
+  return [...firstNamed.entries()]
+    .sort((first, second) => first[1] - second[1])
+    .map(([folder]) => folder)
+    .slice(0, maxWorktreeReads)
 }
 
 // The lines that follow it, which are what is left when a pipe keeps only the end: ` 2 files changed, 3 insertions(+)`
@@ -736,6 +829,28 @@ export const register: Register = (on, options) => {
   }
 
   on('tool.call', async ($, e, next) => {
+    /**
+     * Whether a commit command made a commit, by HEAD's reflog in the session folder or, when that answered and shows
+     * none, in another worktree of its repository that the command names (`namedWorktrees`), where the commit's subject
+     * must also be in the command (`isSubjectIn`): a path can be named by a command that only reads there. The end of
+     * the window is taken before those reads, so a commit made while they run is not this command's.
+     */
+    const isCommitFound = async (command: string, startedAt: number): Promise<boolean> => {
+      const own = await runGit($, reflogArguments, { timeoutMs: reflogTimeout })
+      const endedAt = Date.now()
+      if (isCommitLogged(own, startedAt, endedAt)) return true
+      if (!isGitAnswer(own) || !mayNamePath(command)) return false
+      const [list, cwd, home] = await Promise.all([
+        runGit($, worktreeListArguments, { timeoutMs: reflogTimeout }),
+        $.session.cwd().catch(() => ''),
+        // An empty HOME is unset too.
+        $.env.get('HOME').then(async value => value || (await $.env.get('USERPROFILE'))).catch(() => undefined),
+      ])
+      if (!('exitCode' in list) || list.exitCode !== 0) return false
+      const named = namedWorktrees(command, worktreePaths(list.stdout), cwd, home)
+      const runs = await Promise.all(named.map(folder => runGit($, reflogArguments, { cwd: folder, timeoutMs: reflogTimeout })))
+      return runs.some(run => isCommitLogged(run, startedAt, endedAt, command))
+    }
     if (e.tool === markTool) {
       if (e.agentId !== undefined) return { result: 'Only the main conversation sets the compaction mark.' }
       const input = e as unknown as { state?: unknown; focus?: unknown; resume?: unknown; userSteps?: unknown }
@@ -766,11 +881,7 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined || result.deny !== undefined || result.isError) return result
     // Pointer mode: whether the main agent's commit command made a commit, for the work digest. A call run in the
     // background has only started by now.
-    const isCommitMade =
-      isPointerMode &&
-      isCommitCommand &&
-      input.run_in_background !== true &&
-      isCommitLogged(await runGit($, reflogArguments, { timeoutMs: reflogTimeout }), startedAt, Date.now())
+    const isCommitMade = isPointerMode && isCommitCommand && input.run_in_background !== true && (await isCommitFound(String(input.command), startedAt))
     if (isCommitMade)
       await update($, commitCalls, previous => [...(Array.isArray(previous) ? previous : []), e.tool_use_id].slice(-maxCommitCalls)).catch(() => undefined)
     if (isPointerMode) {

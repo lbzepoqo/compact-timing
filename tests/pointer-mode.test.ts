@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -17,6 +17,8 @@ import {
   lastFailedShell,
   lastReply,
   markSchema,
+  mayNamePath,
+  namedWorktrees,
   openUserSteps,
   parseMark,
   pointerAdvice,
@@ -33,6 +35,8 @@ import {
   workEntries,
   workPart,
   workText,
+  worktreeListArguments,
+  worktreePaths,
   writtenPath,
 } from '../hooks/register'
 
@@ -489,13 +493,17 @@ test('the resume prompt after a pointer does not speak of a summary', () => {
 
 const isReflogRead = (args: readonly string[]) => args[1] === 'reflog'
 
-type Seen = { summarized: string[]; instructions: string[]; installed: string[]; prompts: string[]; gitArgs: string[][]; logs: string[] }
+// `gitFolders` holds the folder of each git run in `gitArgs`, undefined for the session folder.
+type Seen = { summarized: string[]; instructions: string[]; installed: string[]; prompts: string[]; gitArgs: string[][]; gitFolders: (string | undefined)[]; logs: string[] }
 type Overrides = {
   toolCall?: (input: Record<string, unknown>) => unknown
   isRepository?: boolean
   hasCommits?: boolean
-  // HEAD's reflog, newest first, as `git reflog` prints it; the function throws for a git that does not answer.
-  reflog?: () => readonly string[]
+  // HEAD's reflog, newest first, as `git reflog` prints it; the function throws for a git that does not answer. `cwd` is
+  // the folder of the read, undefined for the session folder.
+  reflog?: (cwd?: string) => readonly string[]
+  // The paths `git worktree list` prints, the session folder's own first.
+  worktrees?: readonly string[]
   // The conversation the plugin's compaction replaces.
   messages?: unknown[]
 }
@@ -506,7 +514,7 @@ type Overrides = {
  * what it was told, `installed` the first message of what each plugin compaction left.
  */
 const world = (on: On, $: Engine, tokens = 250_000, overrides: Overrides = {}): Seen => {
-  const seen: Seen = { summarized: [], instructions: [], installed: [], prompts: [], gitArgs: [], logs: [] }
+  const seen: Seen = { summarized: [], instructions: [], installed: [], prompts: [], gitArgs: [], gitFolders: [], logs: [] }
   on('classic.SessionStart', () => ({}) as never)
   on('classic.UserPromptSubmit', () => ({}) as never)
   on('session.end', (_, e) => ({ sessionId: e.sessionId }) as never)
@@ -522,14 +530,22 @@ const world = (on: On, $: Engine, tokens = 250_000, overrides: Overrides = {}): 
   on('session.cwd', () => ({ value: '/repo' }) as never)
   on('process.run', (_, e) => {
     seen.gitArgs.push([...e.argv])
+    seen.gitFolders.push(e.init?.cwd)
     if (overrides.isRepository === false)
       return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n', isStdoutTruncated: false, isStderrTruncated: false } } as never
     const isStatus = e.argv.includes('status')
     // A repository without a commit: the log fails, the status answers.
     if (overrides.hasCommits === false && !isStatus)
       return { value: { exitCode: 128, stdout: '', stderr: "fatal: your current branch 'main' does not have any commits yet\n", isStdoutTruncated: false, isStderrTruncated: false } } as never
-    const reflog = () => `${(overrides.reflog?.() ?? [entry('commit (initial): Start', 1762934400)]).join('\n')}\n`
-    const stdout = isStatus ? ' M src/lex.ts\n?? notes.md\n' : isReflogRead(e.argv) ? reflog() : 'abc123 2026-11-12 09:00 Fix the parser\n'
+    const reflog = () => `${(overrides.reflog?.(e.init?.cwd) ?? [entry('commit (initial): Start', 1762934400)]).join('\n')}\n`
+    const worktrees = () => (overrides.worktrees ?? ['/repo']).map(path => `worktree ${path}\nHEAD 91c4c32\nbranch refs/heads/main\n\n`).join('')
+    const stdout = isStatus
+      ? ' M src/lex.ts\n?? notes.md\n'
+      : isReflogRead(e.argv)
+        ? reflog()
+        : e.argv[1] === 'worktree'
+          ? worktrees()
+          : 'abc123 2026-11-12 09:00 Fix the parser\n'
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } as never
   })
   on('session.compact', (_, e) => {
@@ -667,22 +683,37 @@ test('at the soft limit, a commit reminder without a busy mark uses up the size 
  * wrote is dated now while it runs and in the past once the next call starts, as for calls some seconds apart.
  * `compact` replaces the conversation with the given messages, which `use` builds with the ids the calls were given.
  */
-const reflogWorld = (on: On, $: Engine, overrides: { commits: Record<string, string[]>; answer?: () => boolean; result?: (command: string) => unknown }) => {
+const reflogWorld = (
+  on: On,
+  $: Engine,
+  overrides: {
+    commits: Record<string, string[]>
+    answer?: () => boolean
+    result?: (command: string) => unknown
+    worktrees?: readonly string[]
+    // The worktree a command commits in, when not the session folder's.
+    commitFolder?: (command: string) => string | undefined
+  },
+) => {
   const older = [entry('commit (initial): Start', 1762934400)]
   let latest: string[] = []
   const ids: Record<string, string> = {}
   const messages: unknown[] = []
+  // The folder whose reflog the last call wrote to: undefined for the session folder's.
+  let latestFolder: string | undefined
   const seen = world(on, $, 250_000, {
-    reflog: () => {
+    reflog: cwd => {
       if (overrides.answer?.() === false) throw new Error('timed out')
-      return [...latest.map(subject => entry(subject)), ...older]
+      return [...(cwd === latestFolder ? latest.map(subject => entry(subject)) : []), ...older]
     },
+    worktrees: overrides.worktrees,
     messages,
     toolCall: input => {
       const command = String(input.command)
       ids[command] = String(input.tool_use_id)
       older.unshift(...latest.map(subject => entry(subject, 1762934400)))
       latest = [...(overrides.commits[command] ?? [])].reverse()
+      latestFolder = overrides.commitFolder?.(command)
       return overrides.result?.(command) ?? { result: 'ok', text: '' }
     },
   })
@@ -762,6 +793,123 @@ test('pointer mode: the reflog finds no commit for a rebase, no answer, a failed
   )
   expect(pointer).toContain('## Your work since the conversation started or was last compacted\n')
   expect(pointer).toContain('You: Committing.')
+})
+
+test('the worktrees a command names are the ones read for its commit', () => {
+  expect(worktreeListArguments).toEqual(['worktree', 'list', '--porcelain'])
+  const porcelain = [
+    'worktree /repo\nHEAD 91c4c32\nbranch refs/heads/main\n',
+    'worktree /repo/.claude/worktrees/fix\nHEAD 91c4c32\nbranch refs/heads/fix\n',
+    'worktree "/odd\\npath"\nHEAD 91c4c32\ndetached\n',
+    'worktree /home/ada/repo-worktrees/lexer\nHEAD 91c4c32\nbranch refs/heads/lexer\n',
+  ].join('\n')
+  const paths = worktreePaths(porcelain)
+  expect(paths).toEqual(['/repo', '/repo/.claude/worktrees/fix', '/home/ada/repo-worktrees/lexer'])
+  const named = (command: string, cwd = '/repo') => namedWorktrees(command, paths, cwd, '/home/ada')
+  // By full path, after `cd` or with `git -C`, quoted, or with a folder in it.
+  expect(named('cd /repo/.claude/worktrees/fix && git commit -qm x')).toEqual(['/repo/.claude/worktrees/fix'])
+  expect(named('git -C "/repo/.claude/worktrees/fix" commit -qm x')).toEqual(['/repo/.claude/worktrees/fix'])
+  expect(named("cd '/repo/.claude/worktrees/fix/src'; git commit -qm x")).toEqual(['/repo/.claude/worktrees/fix'])
+  // Under the home folder with `~` or `$HOME`.
+  expect(named('cd ~/repo-worktrees/lexer && git commit -qm x')).toEqual(['/home/ada/repo-worktrees/lexer'])
+  expect(named('cd $HOME/repo-worktrees/lexer && git commit -qm x')).toEqual(['/home/ada/repo-worktrees/lexer'])
+  // The session folder's own worktree is not read again, also from a folder in it, and the main worktree is not named
+  // by the path of one inside it.
+  expect(named('cd /repo && git commit -qm x')).toEqual([])
+  expect(named('cd /repo/.claude/worktrees/fix && git commit -qm x', '/repo/.claude/worktrees/fix/src')).toEqual([])
+  expect(named('cd /repo && git commit -qm x', '/repo/.claude/worktrees/fix')).toEqual(['/repo'])
+  // A path that only starts the same, a relative path, a bare name or no path names none.
+  expect(named('cd /repo/.claude/worktrees/fix-2 && git commit -qm x')).toEqual([])
+  expect(named('cd /home/ada/repo-worktrees/lexer2 && git commit -qm x')).toEqual([])
+  expect(named('cd ../repo-worktrees/lexer && git commit -qm x')).toEqual([])
+  expect(named('cd lexer && git commit -qm "Fix the lexer"')).toEqual([])
+  expect(named('git commit -qm x')).toEqual([])
+  // Two worktrees named, each once, in the order the command names them.
+  expect(named('git -C ~/repo-worktrees/lexer commit -qm x && git -C /repo/.claude/worktrees/fix commit -qm y && cd /repo/.claude/worktrees/fix')).toEqual([
+    '/home/ada/repo-worktrees/lexer',
+    '/repo/.claude/worktrees/fix',
+  ])
+  expect(named('cd /repo/.claude/worktrees/fix && git commit -qm y; cd ~/repo-worktrees/lexer && git commit -qm x')).toEqual([
+    '/repo/.claude/worktrees/fix',
+    '/home/ada/repo-worktrees/lexer',
+  ])
+  // Whatever the command does there: which of them holds this command's commit is for the commit's subject to say.
+  expect(named('git commit -qm x; cat /home/ada/repo-worktrees/lexer/notes.md')).toEqual(['/home/ada/repo-worktrees/lexer'])
+  // The worktrees are listed only for a command that could name a path.
+  expect(mayNamePath('git commit -qm "Fix the parser" || true')).toBe(false)
+  expect(['cd /repo && git commit -qm x', 'cd ~ && git commit -qm x', 'cd $HOME/fix && git commit -qm x', 'cd C:\\repo && git commit -qm x'].every(mayNamePath)).toBe(true)
+  // On Windows: backslashes, either case of the drive, and the Git Bash and WSL spellings.
+  const windows = ['C:/Users/ada/repo', 'C:/Users/ada/repo-wt/fix']
+  const windowsNamed = (command: string) => namedWorktrees(command, windows, 'C:\\Users\\ada\\repo', 'C:\\Users\\ada')
+  expect(windowsNamed('cd C:\\Users\\ada\\repo-wt\\fix; git commit -qm x')).toEqual(['C:/Users/ada/repo-wt/fix'])
+  expect(windowsNamed('cd c:/users/ada/repo-wt/fix && git commit -qm x')).toEqual(['C:/Users/ada/repo-wt/fix'])
+  expect(windowsNamed('cd /c/Users/ada/repo-wt/fix && git commit -qm x')).toEqual(['C:/Users/ada/repo-wt/fix'])
+  expect(windowsNamed('wsl -e bash -c "cd /mnt/c/Users/ada/repo-wt/fix && git commit -qm x"')).toEqual(['C:/Users/ada/repo-wt/fix'])
+  expect(windowsNamed('cd ~/repo-wt/fix && git commit -qm x')).toEqual(['C:/Users/ada/repo-wt/fix'])
+  expect(windowsNamed('cd C:\\Users\\ada\\repo && git commit -qm x')).toEqual([])
+  // Doubled backslashes, as an escaped path has them.
+  expect(windowsNamed('git -C "C:\\\\Users\\\\ada\\\\repo-wt\\\\fix" commit -qm x')).toEqual(['C:/Users/ada/repo-wt/fix'])
+  // At most four are read, the first the command names.
+  const many = Array.from({ length: 6 }, (_, index) => `/wt/w${index}`)
+  const command = [...many].reverse().map(path => `git -C ${path} commit -qm x`).join('; ')
+  expect(namedWorktrees(command, ['/repo', ...many], '/repo', undefined)).toEqual(['/wt/w5', '/wt/w4', '/wt/w3', '/wt/w2'])
+})
+
+test('a commit in another worktree is this command\'s only when its subject is in the command', () => {
+  const now = Math.floor(Date.now() / 1000)
+  const reflog = (subject: string) => ({ exitCode: 0, stdout: `HEAD@{${now}}\t${subject}\n` })
+  const logged = (subject: string, command: string) => isCommitLogged(reflog(subject), now * 1000, now * 1000 + 500, command)
+  expect(logged('commit: Fix the parser', 'cd /wt && git commit -qm "Fix the parser"')).toBe(true)
+  // Word for word, whatever the quoting, the case or an amend.
+  expect(logged('commit: Fix the "parser"', `bash -c "cd /wt && git commit -qm 'Fix the \\"parser\\"'"`)).toBe(true)
+  expect(logged('commit (amend): fix the parser', 'git -C /wt commit -q --amend -m "Fix the parser"')).toBe(true)
+  expect(logged('commit: Fix the parser', 'cd /wt && git commit -qF - <<EOF\nFix the parser\n\nWhy.\nEOF')).toBe(true)
+  // Another subject, a part of a word, a message from a file, or an empty subject is not.
+  expect(logged('commit: Other session work', 'git commit -qm "Fix the parser"; cat /wt/notes.md')).toBe(false)
+  expect(logged('commit: Fix', 'cd /wt && git commit -qm "Fixes"')).toBe(false)
+  expect(logged('commit: Fix the parser', 'cd /wt && git commit -qF msg.txt')).toBe(false)
+  expect(logged('commit: ...', 'cd /wt && git commit -qm ...')).toBe(false)
+  // Without a command, as for the session folder, the subject does not matter.
+  expect(isCommitLogged(reflog('commit: Other session work'), now * 1000, now * 1000 + 500)).toBe(true)
+})
+
+test('pointer mode: a quiet commit in another worktree the command names counts, one in a worktree it only reads in does not', { options: { pointerMode: true } }, async ($, on) => {
+  mock.env(on, { HOME: '/home/ada' })
+  const named = 'cd ~/repo-worktrees/fix && git commit -qm "Fix the parser"'
+  // A commit a hook rejected, while another session commits in a worktree the command reads a file of.
+  const readOnly = 'git commit -qm "Fix the lexer"; cat ~/repo-worktrees/other/notes.md'
+  const noPath = 'git commit -qm "Fix the docs"'
+  const session = reflogWorld(on, $, {
+    commits: { [named]: ['commit: Fix the parser'], [readOnly]: ['commit: Other session work'], [noPath]: ['commit: Fix the docs'] },
+    worktrees: ['/repo', '/home/ada/repo-worktrees/fix', '/home/ada/repo-worktrees/other'],
+    commitFolder: command => (command === named ? '/home/ada/repo-worktrees/fix' : '/home/ada/repo-worktrees/other'),
+  })
+  await start($)
+  await session.run(named)
+  await session.run(readOnly)
+  await session.run(noPath)
+  const reads = session.seen.gitArgs.filter(args => isReflogRead(args) || args[1] === 'worktree')
+  // For each of the first two: the session folder, the list, then only the worktree the command names. The third names
+  // no path, so the worktrees are not listed.
+  expect(reads).toEqual([
+    ['git', ...reflogArguments],
+    ['git', ...worktreeListArguments],
+    ['git', ...reflogArguments],
+    ['git', ...reflogArguments],
+    ['git', ...worktreeListArguments],
+    ['git', ...reflogArguments],
+    ['git', ...reflogArguments],
+  ])
+  const readFolders = session.seen.gitFolders.filter((_, index) => isReflogRead(session.seen.gitArgs[index] ?? []))
+  expect(readFolders).toEqual([undefined, '/home/ada/repo-worktrees/fix', undefined, '/home/ada/repo-worktrees/other', undefined])
+  const pointer = await session.compact(
+    { role: 'assistant', text: 'Fixing the parser.', toolUses: [session.use(named)] },
+    { role: 'assistant', text: 'Fixing the lexer.', toolUses: [session.use(readOnly)] },
+    { role: 'assistant', text: 'Lexer done.', toolUses: [] },
+  )
+  expect(pointer).toContain('## Your work after the last commit\n')
+  expect(pointer).not.toContain('Fixing the parser.')
+  expect(pointer).toContain('You: Fixing the lexer.')
 })
 
 test('pointer mode: a /clear empties the record of commits', { options: { pointerMode: true } }, async ($, on) => {
