@@ -61,7 +61,7 @@ export const shouldCompact = (current: Mark | null, tokens: number | undefined, 
 const thousands = (tokens: number) => `${Math.round(tokens / 1000)}k`
 
 const pointerFocus =
-  'what the next context must keep. At a `boundary` the plugin replaces the conversation with your focus, the requests the user typed, verbatim, `userSteps`, a digest of your work after the last commit (your messages, the tool calls, what failed), your last message, the files written, the transcript path and the commits since the session started; no summary is made. Write it as a handoff: the goal, what is done, the next step, open decisions, what you ruled out and why, file paths. Without a focus the plugin makes a summary instead.'
+  'what the next context must keep. At a `boundary` the plugin replaces the conversation with your focus, the requests the user typed, verbatim, `userSteps`, a digest of your work after the last commit (your messages, the tool calls, what failed), your last message, the files written, the uncommitted changes, the transcript path and the commits since the session started; no summary is made. Write it as a handoff: the goal, what is done, the next step, open decisions, what you ruled out and why, file paths. Without a focus the plugin makes a summary instead.'
 const pointerUserSteps =
   'with `boundary`: every step, command or question you gave the user that they have not yet reported done or answered: commands exactly, the rest briefly, with what each one is for. Steps in the message that ends the turn need not be listed: the pointer keeps that message.'
 
@@ -77,17 +77,24 @@ export const ruleText = (limits: Limits, isPointerMode = false) =>
     `Without a mark the plugin compacts at ${thousands(limits.softTokens)} tokens. Any compaction clears the mark.`,
   ].join('\n')
 
-/** The tool's input schema; `userSteps` only in pointer mode. */
+/**
+ * The tool's input schema; `userSteps` only in pointer mode. Each description says in one line what to write. How the
+ * plugin uses it is in the tool description, which the model reads in the same request, so it is not repeated here.
+ */
 export const markSchema = (isPointerMode = false) => ({
   type: 'object',
   properties: {
     state: { type: 'string', enum: ['boundary', 'busy'] },
     focus: {
       type: 'string',
-      description: isPointerMode ? `What the next context must keep: ${pointerFocus.replace(/^what the next context must keep\. /, '')}` : 'What the summary must keep: the next step, open decisions, file paths.',
+      description: isPointerMode
+        ? 'With `boundary`, the handoff that replaces the conversation: the goal, what is done, the next step, open decisions, what you ruled out and why, file paths. With `busy`, what a summary must keep.'
+        : 'What the summary must keep: the next step, open decisions, file paths.',
     },
-    ...(isPointerMode ? { userSteps: { type: 'string', description: `Pointer mode, ${pointerUserSteps}` } } : {}),
-    resume: { type: 'boolean', description: 'With `boundary`: steps of the current request remain; end the turn and the plugin compacts and sends the focus back.' },
+    ...(isPointerMode
+      ? { userSteps: { type: 'string', description: 'With `boundary`: each step, command or question you gave the user that is still open, commands exactly.' } }
+      : {}),
+    resume: { type: 'boolean', description: 'With `boundary`: steps of the current request remain, so compact and continue.' },
   },
   required: ['state'],
 })
@@ -152,9 +159,44 @@ export const ownCompactFailure = (outcome: OwnCompact): string | null => {
   return outcome.skip === null ? null : `compaction skipped (${outcome.skip})`
 }
 
+const commitCommand = String.raw`\bgit(?:\s+(?:-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+)|--?[\w-]+(?:=\S+)?))*\s+commit(?![\w-])`
+const commitPattern = new RegExp(commitCommand)
+// After `commit`, on its line or one continued with a backslash: any arguments (a quoted one is skipped whole, so a
+// `-q` inside a message does not count), then `--quiet` or a group of short options with a `q` (`-q`, `-aq`, `-qm`),
+// before the next `;`, `&` or `|`. The letters before the `q` leave out the options that take the rest of the word as
+// their value (`-m`, `-F`, `-C`, `-c`, `-t`), so `-mquickfix` is a message.
+const gap = String.raw`(?:[ \t]|\\\r?\n)+`
+const quietCommitPattern = new RegExp(
+  String.raw`${commitCommand}(?:${gap}(?:"(?:[^"\\]|\\[\s\S])*"|'[^']*'|[^\s;&|"'])+)*?${gap}(?:--quiet|-[abd-ln-su-zABDEG-Z]*q[A-Za-z]*)(?=[\s;&|)"'\\]|$)`,
+)
+
 /** A `git commit`, also after global options such as `-C <dir>`, `-c <key=value>` or `--no-pager`. */
-export const isCommit = (command: string) =>
-  /\bgit(?:\s+(?:-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+)|--?[\w-]+(?:=\S+)?))*\s+commit(?![\w-])/.test(command)
+export const isCommit = (command: string) => commitPattern.test(command)
+
+/**
+ * A `git commit` told to print nothing. In a command that goes on to print other things (a test run, a `git log`), the
+ * output then neither shows git's commit line nor is empty. Words in quotes that hold the option, as in
+ * `echo "run git commit -q"`, read the same as `bash -lc "git commit -q"` and count too.
+ */
+export const isQuietCommit = (command: string) => quietCommitPattern.test(command)
+
+/**
+ * The line git prints for a commit it made: `[main 5815a99] Fix the parser`. A command that only names a commit (an
+ * echo, a dry run) or hides its failure behind a pipe prints none. One whose output is cut or quiet is missed by the
+ * work digest, which only makes the digest longer.
+ */
+const committedLine = /^\[[^\]\n]+ [0-9a-f]{7,40}\] /m
+
+// The lines that follow it, which are what is left when a pipe keeps only the end: ` 2 files changed, 3 insertions(+)`
+// and ` create mode 100644 a.ts`. A diff or a pull prints them too, so they count only for the reminder, where the
+// command also holds a `git commit` and a wrong guess costs one note.
+const commitSummaryLine = /^ \d+ files? changed\b|^ (?:create|delete) mode \d{6} /m
+
+// What the model reads for a shell command that printed nothing: `(Bash completed with no output)`.
+const noOutput = /^\(\w+ completed with no output\)$/
+
+/** A result with no output: a command that ran with `-q` or sent its output away. */
+const isSilent = (text: string) => text.trim() === '' || noOutput.test(text.trim())
 
 // On Windows the model commits through either shell.
 const shellTools = ['Bash', 'PowerShell']
@@ -162,6 +204,24 @@ const shellTools = ['Bash', 'PowerShell']
 /** A shell tool call whose command holds a `git commit`. */
 export const isCommitCall = (tool: string, input: Record<string, unknown>): boolean =>
   shellTools.includes(tool) && typeof input.command === 'string' && isCommit(input.command)
+
+/**
+ * Whether a shell call that did not fail counts as a commit for the reminder: its command holds a `git commit`, and its
+ * output has a line git prints for a commit. The words alone are not enough: a command that passes them on in a
+ * prompt, a commit message or an `echo` commits nothing. Four cases go by the command, as all did before 0.12.0:
+ * - a quiet commit (`-q`), which prints no such line whatever else the command prints;
+ * - no output at all (a commit with its output sent away), since nothing says it did not commit;
+ * - no `text`, which is another hook's answer and carries no output;
+ * - a `busy` mark: the reminder then only asks whether the step is done, and it is what gets a stale mark replaced.
+ */
+export const isRemindableCommit = (tool: string, input: Record<string, unknown>, text: string | undefined, current: Mark | null): boolean =>
+  isCommitCall(tool, input) &&
+  (current?.state === 'busy' ||
+    text === undefined ||
+    committedLine.test(text) ||
+    commitSummaryLine.test(text) ||
+    isSilent(text) ||
+    isQuietCommit(String(input.command)))
 
 /**
  * Read right after a commit's result. The tool description alone is often missed, so the reminder
@@ -288,6 +348,39 @@ export const commitsText = (
   return [`${lines.length} ${where}, newest first:`, ...shown, ...more].join('\n')
 }
 
+const maxStatusLines = 40
+
+/**
+ * The `git status` part of the pointer: files changed through a shell command are in no other part, and the work digest
+ * does not say what is still unsaved. The run asks for porcelain output with untracked files and plain paths, so the
+ * user's git settings do not change it. Never throws.
+ */
+export const uncommittedText = (
+  run: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated?: boolean } | { error: string },
+  directory: string,
+): string => {
+  if ('error' in run) return `git status failed in ${directory} (${run.error}).`
+  if (run.exitCode !== 0) return `git status failed in ${directory} (${run.stderr.trim().split('\n')[0] || `exit code ${run.exitCode}`}).`
+  // Not trimmed: the two status letters start the line, and the first may be a space.
+  const lines = run.stdout.split('\n').filter(line => line.trim() !== '')
+  // An output that was cut ends in a partial line, and the count is then a lower bound.
+  const isCut = run.isStdoutTruncated === true
+  if (isCut) lines.pop()
+  if (lines.length === 0 && !isCut) return `None: the working tree in ${directory} was clean when this message was made.`
+  const shown = lines.slice(0, maxStatusLines)
+  const hidden = lines.length - shown.length
+  // git's output is cut only when it is very long, so in practice a cut one also has hidden lines.
+  const more = [...(hidden > 0 ? [`... and ${hidden} more`] : []), ...(isCut ? ['... and others: the output of git status was cut'] : [])]
+  return [
+    `${lines.length}${isCut ? ' or more' : ''} in ${directory} when this message was made (\`git status --porcelain\`: two status letters, then the path from the repository root):`,
+    ...shown,
+    ...more,
+  ].join('\n')
+}
+
+/** Whether a git run gave its answer. */
+const isGitAnswer = (run: { exitCode: number } | { error: string }) => 'exitCode' in run && run.exitCode === 0
+
 /**
  * The model's last message with text: the mark is set inside a turn, so steps given to the user in the turn's closing
  * message come after it. The end is kept, since a closing message ends with what it asks.
@@ -315,13 +408,6 @@ const minFocus = 200
 // Tools whose result is on disk or can be had again by the same call, so the digest names the call alone.
 const repeatableTools = ['Read', 'Grep', 'Glob', 'Write', 'Edit', 'NotebookEdit']
 
-/**
- * The line git prints for a commit it made: `[main 5815a99] Fix the parser`. A command that only names a commit (an
- * echo, a dry run) or hides its failure behind a pipe prints none, and one whose output is cut or quiet is missed,
- * which only makes the digest longer.
- */
-const committedLine = /^\[[^\]\n]+ [0-9a-f]{7,40}\] /m
-
 /** The start of a text, with a note where it was cut. */
 const clipEnd = (text: string, limit: number) => (text.length > limit ? `${text.slice(0, limit)} ...(cut)` : text)
 
@@ -342,14 +428,14 @@ const callBrief = (use: WorkToolUse): string => {
   return `${use.tool}: ${clipEnd(typeof named === 'string' ? named.trim() : JSON.stringify(input), maxWorkCall)}`
 }
 
-/** One line or block of the work digest. `isCommit` for a shell call that committed, `isFailedShell` for one that failed. */
-export type WorkEntry = { text: string; isShell: boolean; isCommit: boolean; isFailedShell: boolean }
+/** One line or block of the work digest. `isCommit` for a shell call that committed. */
+export type WorkEntry = { text: string; isCommit: boolean }
 
 /** What the digest keeps of a call's result: a failure and any result that cannot be had again, cut; of a shell output, the end. */
 const callOutcome = (use: WorkToolUse): string => {
   const output = (use.text ?? '').trim()
   if (use.isError === true) return `\nfailed: ${clipMiddle(output, maxWorkResult) || 'no output'}`
-  if (!output || repeatableTools.includes(use.tool)) return ''
+  if (isSilent(output) || repeatableTools.includes(use.tool)) return ''
   return shellTools.includes(use.tool) ? `\noutput ends: ${output.slice(-maxWorkOutput)}` : `\nresult: ${clipMiddle(output, maxWorkResult)}`
 }
 
@@ -369,15 +455,11 @@ export const workEntries = (messages: readonly WorkMessage[], toolName: string):
   messages.forEach((message, index) => {
     if (message.role !== 'assistant') return
     const text = (message.text ?? '').trim()
-    if (text && index !== replyIndex) add(`You: ${clipEnd(text, maxWorkReply)}`, { isShell: false, isCommit: false, isFailedShell: false })
+    if (text && index !== replyIndex) add(`You: ${clipEnd(text, maxWorkReply)}`, { isCommit: false })
     for (const use of message.toolUses ?? []) {
       if (use.tool === toolName) continue
-      const isShell = shellTools.includes(use.tool)
-      const isFailed = use.isError === true
       add(`${callBrief(use)}${callOutcome(use)}`, {
-        isShell,
-        isCommit: !isFailed && isCommitCall(use.tool, use.input ?? {}) && committedLine.test(use.text ?? ''),
-        isFailedShell: isShell && isFailed,
+        isCommit: use.isError !== true && isCommitCall(use.tool, use.input ?? {}) && committedLine.test(use.text ?? ''),
       })
     }
   })
@@ -427,13 +509,44 @@ export const workPart = (messages: readonly WorkMessage[], toolName: string): st
   }
 }
 
+// Past this many tool calls after a failed command, the work has moved on from it.
+const maxCallsAfterFailure = 20
+
 /**
- * The last shell command after the last commit, in one line, when it failed; else null. A search that matched nothing
- * fails too, so what a caller says about it is worded as a condition.
+ * The last shell command, in one line, when it failed and at most maxCallsAfterFailure tool calls came after it; else
+ * null. A commit is a shell command that did not fail, so nothing was committed after the one found. A search that
+ * matched nothing fails too, so what a caller says about it is worded as a condition. Read from the end, since the
+ * summary hook calls this on every compaction.
  */
 export const lastFailedShell = (messages: readonly WorkMessage[], toolName: string): string | null => {
-  const lastShell = afterLastCommit(workEntries(messages, toolName)).entries.filter(entry => entry.isShell).at(-1)
-  return lastShell?.isFailedShell ? clipEnd(lastShell.text.split('\n')[0] ?? '', 120) : null
+  let laterCalls = 0
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (message?.role !== 'assistant') continue
+    for (const use of [...(message.toolUses ?? [])].reverse()) {
+      if (use.tool === toolName) continue
+      if (shellTools.includes(use.tool)) return use.isError === true ? clipEnd(callBrief(use).split('\n')[0] ?? '', 120) : null
+      if (++laterCalls > maxCallsAfterFailure) return null
+    }
+  }
+  return null
+}
+
+/**
+ * Asked of a summary when the last shell command failed and nothing was committed after it: no model set `busy` while
+ * debugging in the tests, so a compaction can land inside an unfinished step with no mark and no focus to keep its
+ * details. Empty when `lastFailedShell` finds none, and when the conversation cannot be read: a compaction must not
+ * fail over this.
+ */
+export const unfinishedStep = (messages: readonly WorkMessage[], toolName: string): string => {
+  try {
+    const failed = lastFailedShell(messages, toolName)
+    return failed === null
+      ? ''
+      : `The last shell command in the conversation failed and nothing was committed after it (${failed}). If the step it belongs to is unfinished, keep what was being tried, the exact error text and what was already ruled out.`
+  } catch {
+    return ''
+  }
 }
 
 /**
@@ -461,26 +574,29 @@ export const pointerAdvice = (current: Mark, messages: readonly WorkMessage[], t
 export const pointerText = (parts: PointerParts, reply: string, work: string) =>
   [
     `Compacted by the compact-timing plugin at ${thousands(parts.tokens)} tokens, at a \`boundary\` mark, in pointer mode: this message replaced the conversation, and no summary was made.`,
-    'compact-timing: an automatic message from a plugin, not written by the user. You wrote the focus, the open steps and the last message; the plugin added the user\'s requests, the digest of your work, the files written, the transcript path and the commits.',
+    `compact-timing: an automatic message from a plugin, not written by the user. You wrote the focus, the open steps and the last message; the plugin added the user\'s requests, the digest of your work, the files written${parts.uncommitted ? ', the uncommitted changes' : ''}, the transcript path and the commits.`,
     `## Focus\n${parts.focus || 'None given.'}`,
     `## The user's requests\nVerbatim, oldest first; a later request can change an earlier one.\n${parts.requests}`,
     `## Open steps you gave the user\n${parts.userSteps || 'None listed.'}`,
     work,
     `## Your last message\n${reply || 'None found.'}`,
     `## Files written this session with Write, Edit or NotebookEdit\nFiles changed through Bash are not listed.\n${parts.files}`,
+    // Left out where git answers neither question, as outside a repository: the commits part already says why.
+    ...(parts.uncommitted ? [`## Uncommitted changes\n${parts.uncommitted}`] : []),
     `## Transcript\n${parts.transcriptPath}\nFor anything else from the conversation (requests left out above, error text, paths, numbers), ${transcriptSearchHow} Search it before asking the user for something they may already have given, and before acting on a command, an error or a value the focus names without giving it exactly.`,
     `## Commits\n${parts.commits}`,
   ].join('\n\n')
 
 /**
  * Instructions for every compaction of the main conversation: the ones given, or the mark's focus for a compaction
- * Claude Code starts itself (trigger `auto` or `precompute`), followed by the open user steps and the transcript search.
- * Only a `busy` mark outlives its turn, so the focus keeps the details of an unfinished step in the summary.
+ * Claude Code starts itself (trigger `auto` or `precompute`), followed by the request for an unfinished step when there
+ * is one (`unfinishedStep`), the open user steps and the transcript search, which stays last since it names the
+ * summary's last line. Only a `busy` mark outlives its turn, so the focus keeps the details of an unfinished step.
  */
-export const compactInstructions = (trigger: string, instructions: string | undefined, current: Mark | null) => {
+export const compactInstructions = (trigger: string, instructions: string | undefined, current: Mark | null, unfinished = '') => {
   const isEngine = trigger === 'auto' || trigger === 'precompute'
   const given = instructions?.trim() || (isEngine ? current?.focus : '')
-  return [given, openUserSteps, transcriptSearch].filter(Boolean).join('\n\n')
+  return [given, unfinished, openUserSteps, transcriptSearch].filter(Boolean).join('\n\n')
 }
 
 /**
@@ -585,13 +701,15 @@ export const register: Register = (on, options) => {
       const written = writtenPath(e.tool, e as unknown as Record<string, unknown>)
       if (written !== null) await update($, sessionRecord, previous => addFile(previous, written)).catch(() => undefined)
     }
-    const isCommitting = isCommitCall(e.tool, e as unknown as Record<string, unknown>)
+    const input = e as unknown as Record<string, unknown>
+    const isCommitCommand = isCommitCall(e.tool, input)
     const isNudged = await read($, nudged).catch(() => true)
-    if (!isCommitting && isNudged) return result
+    if (!isCommitCommand && isNudged) return result
     const [current, tokens] = await Promise.all([
       read($, mark).catch(() => null),
       $.session.usage().then(usage => usage.context.tokens).catch(() => undefined),
     ])
+    const isCommitting = isRemindableCommit(e.tool, input, result.text, current)
     const context: string[] = []
     const isReminded = isCommitting && shouldRemind(current, tokens, limits)
     if (isReminded) context.push(commitReminder(markTool, current))
@@ -646,9 +764,17 @@ export const register: Register = (on, options) => {
             const directory = await $.session.cwd()
             const since = new Date(usage.startedAt).toISOString()
             // The author tells the model's own commits from ones a pull brought in.
-            const run = await $.process
-              .run(['git', 'log', `--since=${since}`, '--format=%h %ad %an: %s', '--date=format:%Y-%m-%d %H:%M'], { cwd: directory, timeoutMs: 10_000 })
-              .catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) }))
+            const git = (...gitArguments: string[]) =>
+              $.process
+                .run(['git', ...gitArguments], { cwd: directory, timeoutMs: 10_000 })
+                .catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) }))
+            // `--no-optional-locks`: a status in the background must not hold the index lock against a `git add` or
+            // `git commit` the user or another session runs at that moment. The other two options override settings
+            // that would hide untracked files or write a path with other than plain letters as escapes.
+            const [run, status] = await Promise.all([
+              git('log', `--since=${since}`, '--format=%h %ad %an: %s', '--date=format:%Y-%m-%d %H:%M'),
+              git('--no-optional-locks', '-c', 'core.quotePath=false', 'status', '--porcelain', '--untracked-files=normal'),
+            ])
             const record = await read($, sessionRecord).catch(() => null)
             parts = {
               tokens,
@@ -656,6 +782,9 @@ export const register: Register = (on, options) => {
               userSteps: marked.userSteps ?? '',
               requests: record ? requestsText(record) : unreadRecord,
               files: record ? filesText(record) : unreadRecord,
+              // Both fail outside a repository, and the commits part then says why, once. A repository without a
+              // commit fails only the log, and there everything is uncommitted.
+              uncommitted: isGitAnswer(status) || isGitAnswer(run) ? uncommittedText(status, directory) : '',
               transcriptPath: path,
               commits: commitsText(run, directory, since),
             }
@@ -742,7 +871,7 @@ export const register: Register = (on, options) => {
     // Another plugin's direct compaction carries its own instructions. This plugin's runs as `/compact` (`manual`).
     if (pointed === null && e.agentId === undefined && e.trigger !== 'plugin') {
       const current = await read($, mark).catch(() => null)
-      e = { ...e, instructions: compactInstructions(e.trigger, e.instructions, current) }
+      e = { ...e, instructions: compactInstructions(e.trigger, e.instructions, current, unfinishedStep(e.messages, markTool)) }
     }
     const result = pointed ?? (await next(e))
     if (e.agentId === undefined && e.trigger === 'manual') {

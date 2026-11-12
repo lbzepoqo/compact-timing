@@ -7,11 +7,16 @@ import {
   addRequest,
   afterLastCommit,
   commitsText,
+  compactInstructions,
   emptyRecord,
   filesText,
   isCommitCall,
+  isQuietCommit,
+  isRemindableCommit,
+  lastFailedShell,
   lastReply,
   markSchema,
+  openUserSteps,
   parseMark,
   pointerAdvice,
   pointerText,
@@ -20,6 +25,8 @@ import {
   ruleText,
   transcriptSearch,
   transcriptSearchHow,
+  uncommittedText,
+  unfinishedStep,
   userRequest,
   workEntries,
   workPart,
@@ -40,6 +47,16 @@ test('pointer mode adds userSteps to the tool and the rule; off, both stay as th
   expect(ruleText(limits, true)).toContain('no summary is made')
   expect(Object.keys(markSchema().properties)).toEqual(['state', 'focus', 'resume'])
   expect(Object.keys(markSchema(true).properties)).toEqual(['state', 'focus', 'userSteps', 'resume'])
+})
+
+test('the schema says what to write in a line each and leaves how the plugin uses it to the tool description', () => {
+  for (const isPointerMode of [false, true]) {
+    const properties = markSchema(isPointerMode).properties as Record<string, { description?: string }>
+    for (const property of Object.values(properties)) expect((property.description ?? '').length).toBeLessThan(200)
+  }
+  expect(JSON.stringify(markSchema(true))).not.toContain('no summary is made')
+  expect(markSchema(true).properties.focus.description).toContain('With `boundary`, the handoff that replaces the conversation')
+  expect(ruleText(limits, true)).toContain('the files written, the uncommitted changes, the transcript path')
 })
 
 test('userSteps is kept only with boundary and only when given', () => {
@@ -77,6 +94,27 @@ test('the commits part lists the log, none, or why git gave none', () => {
   expect(text).toContain('... and 5 older')
 })
 
+test('the uncommitted part lists the status lines, a clean tree, or why git gave none', () => {
+  expect(uncommittedText({ exitCode: 0, stdout: ' M src/lex.ts\n?? notes.md\n', stderr: '' }, '/repo')).toBe(
+    '2 in /repo when this message was made (`git status --porcelain`: two status letters, then the path from the repository root):\n M src/lex.ts\n?? notes.md',
+  )
+  expect(uncommittedText({ exitCode: 0, stdout: '', stderr: '' }, '/repo')).toBe('None: the working tree in /repo was clean when this message was made.')
+  expect(uncommittedText({ exitCode: 128, stdout: '', stderr: 'fatal: bad index\nmore' }, '/repo')).toBe('git status failed in /repo (fatal: bad index).')
+  expect(uncommittedText({ exitCode: 1, stdout: '', stderr: '' }, '/repo')).toBe('git status failed in /repo (exit code 1).')
+  expect(uncommittedText({ error: 'timed out' }, '/repo')).toBe('git status failed in /repo (timed out).')
+  const many = Array.from({ length: 45 }, (_, index) => ` M file${index}.ts`).join('\n')
+  const text = uncommittedText({ exitCode: 0, stdout: many, stderr: '' }, '/repo')
+  expect(text).toContain('45 in /repo')
+  expect(text).toContain('\n M file39.ts')
+  expect(text).not.toContain('file40.ts')
+  expect(text.endsWith('... and 5 more')).toBe(true)
+  // A cut output: its last line is partial, and the count a lower bound.
+  const cut = uncommittedText({ exitCode: 0, stdout: `${many}\n M part`, stderr: '', isStdoutTruncated: true }, '/repo')
+  expect(cut.startsWith('45 or more in /repo')).toBe(true)
+  expect(cut).not.toContain('part')
+  expect(cut.endsWith(' M file39.ts\n... and 5 more\n... and others: the output of git status was cut')).toBe(true)
+})
+
 test('the last reply is the newest assistant text, its end kept', () => {
   const messages = [
     { role: 'user' as const, text: 'Fix it' },
@@ -100,6 +138,7 @@ test('the pointer holds the label, focus, open steps, last reply, transcript pat
       userSteps: 'Run `make test`.',
       requests: '- Fix the parser',
       files: '/repo/parser.ts',
+      uncommitted: ' M src/lex.ts',
       transcriptPath: transcript,
       commits: 'None in /repo since x.',
     },
@@ -119,7 +158,10 @@ test('the pointer holds the label, focus, open steps, last reply, transcript pat
   expect(text).toContain(`## Transcript\n${transcript}\n`)
   expect(text).toContain(transcriptSearchHow)
   expect(text).toContain('## Commits\nNone in /repo since x.')
-  const empty = pointerText({ tokens: 1, focus: '', userSteps: '', requests: 'None recorded.', files: 'None recorded.', transcriptPath: transcript, commits: 'c' }, '', 'work')
+  expect(text).toContain('/repo/parser.ts\n\n## Uncommitted changes\n M src/lex.ts\n\n## Transcript')
+  const empty = pointerText({ tokens: 1, focus: '', userSteps: '', requests: 'None recorded.', files: 'None recorded.', uncommitted: '', transcriptPath: transcript, commits: 'c' }, '', 'work')
+  expect(empty).not.toContain('## Uncommitted changes')
+  expect(empty).toContain('None recorded.\n\n## Transcript')
   expect(empty).toContain('## Focus\nNone given.')
   expect(empty).toContain('## Open steps you gave the user\nNone listed.')
 })
@@ -146,6 +188,86 @@ test('a commit is found in either shell, and only there', () => {
   expect(isCommitCall('Bash', {})).toBe(false)
 })
 
+test('the commit reminder goes by the line git prints, not by the words in the command', () => {
+  const command = 'git add -A && git commit -m "Fix"'
+  const busy = { state: 'busy' as const, focus: '' }
+  expect(isRemindableCommit('Bash', { command }, '[main 5815a99] Fix\n 1 file changed', null)).toBe(true)
+  expect(isRemindableCommit('PowerShell', { command: 'git commit -m x' }, '[main 5815a99] x', null)).toBe(true)
+  // The words alone: a prompt passed to another program, an echo, a dry run, a commit a hook rejected behind a pipe.
+  expect(isRemindableCommit('Bash', { command: 'claude -p "then run git commit -m x"' }, 'Done.', null)).toBe(false)
+  expect(isRemindableCommit('Bash', { command: 'echo "then run git commit"' }, 'then run git commit', null)).toBe(false)
+  expect(isRemindableCommit('Bash', { command: 'git commit --dry-run' }, 'On branch main', null)).toBe(false)
+  expect(isRemindableCommit('Bash', { command: 'git commit -m "Fix the -q flag" 2>&1 | tail -5' }, 'lint failed', null)).toBe(false)
+  expect(isRemindableCommit('Bash', { command: 'git commit -m again\nif [ $? -eq 0 ]; then echo ok; fi' }, 'nothing added to commit', null)).toBe(false)
+  // A pipe that kept only the end of git's commit output.
+  expect(isRemindableCommit('Bash', { command: 'git commit -m x 2>&1 | tail -2' }, ' 2 files changed, 3 insertions(+)\n create mode 100644 a.ts', null)).toBe(true)
+  expect(isRemindableCommit('Bash', { command: 'git commit -m x 2>&1 | tail -1' }, ' delete mode 100644 a.ts', null)).toBe(true)
+  // No output (a quiet commit, or its output sent away) and another hook's answer, which has no text, go by the command.
+  expect(isRemindableCommit('Bash', { command: 'git commit -qm x' }, '', null)).toBe(true)
+  expect(isRemindableCommit('Bash', { command: 'git commit -m "a; b" -q' }, '(Bash completed with no output)', null)).toBe(true)
+  expect(isRemindableCommit('Bash', { command: 'git commit -m x >/dev/null' }, '(Bash completed with no output)\n', null)).toBe(true)
+  expect(isRemindableCommit('Bash', { command }, undefined, null)).toBe(true)
+  // A quiet commit in a command that goes on to print: the three commits of the session that wrote this rule.
+  const logged = 'tsc=0\n 47 pass\n 0 fail\n5aad6be compact-timing: the last failed shell command\n88228d1 compact-timing: the pointer adds a digest'
+  expect(isRemindableCommit('Bash', { command: `wsl -e bash -lc "cd ~/repo && tsc --noEmit -p . ; echo tsc=\\$? && git add -A && git commit -q -F - <<'EOF'\nSubject\n\nBody.\nEOF\ngit log --oneline | head -2"` }, logged, null)).toBe(true)
+  expect(isRemindableCommit('Bash', { command: 'wsl -e bash -lc "cd ~/repo && git commit -q --amend -F /tmp/message.txt && git diff --stat"' }, ' plugin.json | 2 +-', null)).toBe(true)
+  expect(isRemindableCommit('Bash', { command: `git commit -q -am 'Bump the version' && git log --format='%h %s' | head -4` }, '08a0b35 Bump the version', null)).toBe(true)
+  // The price of that: quoted words with the quiet option read the same as `bash -lc "git commit -q"`.
+  expect(isRemindableCommit('Bash', { command: 'echo "run git commit -q later"' }, 'run git commit -q later', null)).toBe(true)
+  // So does a busy mark, whose reminder only asks whether the step is done.
+  expect(isRemindableCommit('Bash', { command: 'git commit -m x 2>&1 | tail -1' }, 'lint failed', busy)).toBe(true)
+  expect(isRemindableCommit('Bash', { command: 'git commit -m x 2>&1 | tail -1' }, 'lint failed', { state: 'boundary', focus: '' })).toBe(false)
+  expect(isRemindableCommit('Bash', { command: 'git status' }, undefined, busy)).toBe(false)
+  expect(isRemindableCommit('Write', { command }, '[main 5815a99] Fix', busy)).toBe(false)
+})
+
+test('a quiet commit has -q, --quiet or a q among its short options, outside a quoted argument', () => {
+  expect(isQuietCommit('git commit -q -m x')).toBe(true)
+  expect(isQuietCommit('git -C /repo commit -aqm x')).toBe(true)
+  expect(isQuietCommit('git commit -m x --quiet')).toBe(true)
+  expect(isQuietCommit('git commit -m "a; b" -q')).toBe(true)
+  expect(isQuietCommit('git commit -qm"x"')).toBe(true)
+  expect(isQuietCommit('bash -lc "git commit -m x -q"')).toBe(true)
+  expect(isQuietCommit('git commit -m x')).toBe(false)
+  expect(isQuietCommit('git commit --squash HEAD')).toBe(false)
+  expect(isQuietCommit('git commit -m "Fix the -q flag of the parser" 2>&1 | tail -3')).toBe(false)
+  expect(isQuietCommit("git commit -m 'Explain why grep -q is used'")).toBe(false)
+  expect(isQuietCommit('git commit -m "Add -sequential mode" | tail -2')).toBe(false)
+  expect(isQuietCommit('git commit -m x && grep -q y file')).toBe(false)
+  expect(isQuietCommit('git commit -m x; git push -q')).toBe(false)
+  expect(isQuietCommit('git push -q')).toBe(false)
+  // The option is looked for on the commit's own line, or one continued with a backslash.
+  expect(isQuietCommit('git commit -m x\ngit push -q')).toBe(false)
+  expect(isQuietCommit('git commit -m x\nif [ $? -eq 0 ]; then echo ok; fi')).toBe(false)
+  expect(isQuietCommit("git commit -F - <<'EOF'\nSubject\n\nThe -q flag is explained\nEOF")).toBe(false)
+  expect(isQuietCommit('git commit -m x \\\n  -q')).toBe(true)
+  expect(isQuietCommit('git commit -m x -q\\\n  --no-verify')).toBe(true)
+  // A message attached to its option, and one with an escaped quote.
+  expect(isQuietCommit('git commit -mquickfix')).toBe(false)
+  expect(isQuietCommit('git commit -amquickfix')).toBe(false)
+  expect(isQuietCommit('git commit -m "a \\" b" -q')).toBe(true)
+})
+
+test('a summary is asked to keep an unfinished step when the last shell command after the last commit failed', () => {
+  const line = unfinishedStep(session, markTool)
+  expect(lastFailedShell(session, markTool)).toBe('Bash: bun test tabs')
+  expect(line).toContain('failed and nothing was committed after it (Bash: bun test tabs)')
+  expect(line).toContain('If the step it belongs to is unfinished, keep what was being tried, the exact error text')
+  // The commit is the last shell command, and a conversation that cannot be read.
+  expect(lastFailedShell(session.slice(0, 4), markTool)).toBeNull()
+  expect(unfinishedStep(session.slice(0, 4), markTool)).toBe('')
+  expect(unfinishedStep([{ role: 'assistant', text: '', toolUses: [null as never] }], markTool)).toBe('')
+  // Twenty tool calls after the failure it still counts; one more, and the work has moved on.
+  const reads = (count: number) => Array.from({ length: count }, () => ({ role: 'assistant' as const, text: '', toolUses: [{ tool: 'Read', input: { file_path: '/repo/a.ts' }, text: 'x' }] }))
+  expect(lastFailedShell([...session, ...reads(20)], markTool)).toBe('Bash: bun test tabs')
+  expect(lastFailedShell([...session, ...reads(21)], markTool)).toBeNull()
+  expect(unfinishedStep([...session, ...reads(20)], markTool)).toBe(line)
+  expect(unfinishedStep([...session, ...reads(21)], markTool)).toBe('')
+  // After the given instructions, before the standing ones: the transcript search names the summary's last line.
+  expect(compactInstructions('manual', 'keep the plan', null, line)).toBe(`keep the plan\n\n${line}\n\n${openUserSteps}\n\n${transcriptSearch}`)
+  expect(compactInstructions('auto', undefined, null, '')).toBe(`${openUserSteps}\n\n${transcriptSearch}`)
+})
+
 test('the work entries hold what was said and each tool call, without the mark, the last reply and read results', () => {
   const entries = workEntries(session, markTool)
   expect(entries.map(entry => entry.text.split('\n')[0])).toEqual([
@@ -162,7 +284,6 @@ test('the work entries hold what was said and each tool call, without the mark, 
   expect(entries[4]?.text).toBe('Edit: /repo/src/lex.ts')
   expect(entries[5]?.text.endsWith('\n  12 pass')).toBe(true)
   expect(entries[5]?.text.length).toBeLessThan(240)
-  expect(entries[6]?.isFailedShell).toBe(true)
   expect(entries[6]?.text).toContain('\n  failed: error: expected 2\n  y')
   expect(entries[6]?.text).toContain('...(cut)...')
   expect(entries[6]?.text.endsWith('1 fail')).toBe(true)
@@ -201,6 +322,8 @@ test('a result that cannot be had again is kept, cut; lines after the first are 
   expect(entries[1]?.text.endsWith('\n  Done.')).toBe(true)
   expect(entries[1]?.text.length).toBeLessThan(700)
   expect(entries[2]?.text).toBe('Bash: cat <<EOF\n  ## Focus\n  EOF\n  output ends: ## Focus')
+  // A command that printed nothing is its line alone.
+  expect(workEntries([{ role: 'assistant', text: '', toolUses: [shell('git add b.txt', '(Bash completed with no output)')] }], markTool)[0]?.text).toBe('Bash: git add b.txt')
   expect(entries.every(entry => !/\n\S/.test(entry.text))).toBe(true)
 })
 
@@ -309,15 +432,16 @@ test('the resume prompt after a pointer does not speak of a summary', () => {
   expect(resumePrompt('Next: step 3.')).toContain('The summary is newer than this focus')
 })
 
-type Seen = { summarized: string[]; installed: string[]; prompts: string[]; gitArgs: string[][]; logs: string[] }
+type Seen = { summarized: string[]; instructions: string[]; installed: string[]; prompts: string[]; gitArgs: string[][]; logs: string[] }
+type Overrides = { toolCall?: (input: Record<string, unknown>) => unknown; isRepository?: boolean; hasCommits?: boolean }
 
 /**
  * The world beneath the plugin: the session size, git, and `/compact`, whose command runs the compaction with the
- * trigger `manual` as Claude Code does. `summarized` holds each compaction that reached the summarizer, `installed` the
- * first message of what each plugin compaction left.
+ * trigger `manual` as Claude Code does. `summarized` holds each compaction that reached the summarizer and `instructions`
+ * what it was told, `installed` the first message of what each plugin compaction left.
  */
-const world = (on: On, $: Engine, tokens = 250_000): Seen => {
-  const seen: Seen = { summarized: [], installed: [], prompts: [], gitArgs: [], logs: [] }
+const world = (on: On, $: Engine, tokens = 250_000, overrides: Overrides = {}): Seen => {
+  const seen: Seen = { summarized: [], instructions: [], installed: [], prompts: [], gitArgs: [], logs: [] }
   on('classic.SessionStart', () => ({}) as never)
   on('classic.UserPromptSubmit', () => ({}) as never)
   on('session.end', (_, e) => ({ sessionId: e.sessionId }) as never)
@@ -333,10 +457,18 @@ const world = (on: On, $: Engine, tokens = 250_000): Seen => {
   on('session.cwd', () => ({ value: '/repo' }) as never)
   on('process.run', (_, e) => {
     seen.gitArgs.push([...e.argv])
-    return { value: { exitCode: 0, stdout: 'abc123 2026-11-12 09:00 Fix the parser\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } as never
+    if (overrides.isRepository === false)
+      return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n', isStdoutTruncated: false, isStderrTruncated: false } } as never
+    const isStatus = e.argv.includes('status')
+    // A repository without a commit: the log fails, the status answers.
+    if (overrides.hasCommits === false && !isStatus)
+      return { value: { exitCode: 128, stdout: '', stderr: "fatal: your current branch 'main' does not have any commits yet\n", isStdoutTruncated: false, isStderrTruncated: false } } as never
+    const stdout = isStatus ? ' M src/lex.ts\n?? notes.md\n' : 'abc123 2026-11-12 09:00 Fix the parser\n'
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } as never
   })
   on('session.compact', (_, e) => {
     seen.summarized.push(e.trigger)
+    seen.instructions.push(e.instructions ?? '')
     return { messages: [{ role: 'user', text: 'the summary', toolUses: [] }] }
   })
   on('command.run', async (_, e) => {
@@ -362,8 +494,8 @@ const world = (on: On, $: Engine, tokens = 250_000): Seen => {
     return { value: undefined } as never
   })
   on('ui.toast', () => ({ value: undefined }) as never)
-  // Tools other than the mark: the call succeeds.
-  on('tool.call', () => ({ result: 'ok' }) as never)
+  // Tools other than the mark: the call succeeds, with no output unless the test gives one.
+  on('tool.call', (_, e) => (overrides.toolCall?.(e as unknown as Record<string, unknown>) ?? { result: 'ok' }) as never)
   return seen
 }
 
@@ -389,9 +521,70 @@ test('pointer mode: the plugin compaction at a boundary replaces the conversatio
   expect(pointer).toContain('## Your last message\nFixed and committed. Please run `make deploy`.')
   expect(pointer).toContain(`## Transcript\n${transcript}`)
   expect(pointer).toContain('abc123 2026-11-12 09:00 Fix the parser')
+  expect(pointer).toContain('## Uncommitted changes\n2 in /repo when this message was made')
+  expect(pointer).toContain('\n M src/lex.ts\n?? notes.md\n\n## Transcript')
   expect(seen.gitArgs[0]?.slice(0, 3)).toEqual(['git', 'log', '--since=2026-11-12T08:00:00.000Z'])
+  expect(seen.gitArgs[1]).toEqual(['git', '--no-optional-locks', '-c', 'core.quotePath=false', 'status', '--porcelain', '--untracked-files=normal'])
+  expect(seen.gitArgs.length).toBe(2)
   expect(seen.prompts.length).toBe(1)
   expect(seen.prompts[0]).toContain('replaced the conversation with a pointer')
+})
+
+test('pointer mode: outside a repository the pointer says so once and has no uncommitted part', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $, 250_000, { isRepository: false })
+  await start($)
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
+  await endTurn($)
+  const pointer = seen.installed[0] ?? ''
+  expect(pointer).toContain('## Commits\ngit log failed in /repo since 2026-11-12T08:00:00.000Z (fatal: not a git repository)')
+  expect(pointer).not.toContain('## Uncommitted changes')
+  expect(pointer).toContain('the files written, the transcript path and the commits.')
+})
+
+test('pointer mode: a repository without a commit still lists the uncommitted changes', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $, 250_000, { hasCommits: false })
+  await start($)
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
+  await endTurn($)
+  const pointer = seen.installed[0] ?? ''
+  expect(pointer).toContain('## Commits\ngit log failed in /repo')
+  expect(pointer).toContain('## Uncommitted changes\n2 in /repo')
+})
+
+test('the commit reminder follows a command that committed, not one that names a commit', async ($, on) => {
+  const outputs: Record<string, string | undefined> = {
+    'git commit -m x': '[main 5815a99] x\n 1 file changed',
+    'echo "then run git commit"': 'then run git commit',
+    'git commit -qm z': '',
+  }
+  // The last command stands for a call another plugin's hook answered, which has no output text.
+  world(on, $, 250_000, { toolCall: input => (input.command === 'git commit -m y' ? { result: 'ok' } : { result: 'ok', text: outputs[String(input.command)] }) })
+  await start($)
+  const context = async (command: string) => ((await $.tool.call({ tool: 'Bash', command } as never)) as { context?: string[] }).context ?? []
+  expect((await context('git commit -m x'))[0]).toContain('this commit saved work outside the conversation')
+  expect(await context('echo "then run git commit"')).toEqual([])
+  expect((await context('git commit -qm z')).length).toBe(1)
+  expect((await context('git commit -m y')).length).toBe(1)
+  // Under a busy mark the words are enough, and the reminder asks whether the step is done.
+  await setMark($, { state: 'busy' })
+  expect((await context('echo "then run git commit"'))[0]).toContain('the mark is `busy`')
+})
+
+test('a summary of the main conversation is asked for the unfinished step, a subagent\'s is not', async ($, on) => {
+  const seen = world(on, $)
+  await start($)
+  // The engine takes only whole messages: each tool use with its id.
+  const messages = session.map((message, messageIndex) => ({
+    ...message,
+    toolUses: (message.toolUses ?? []).map((use, useIndex) => ({ tool_use_id: `toolu_${messageIndex}_${useIndex}`, ...use })),
+  }))
+  await $.session.compact({ trigger: 'auto', messages } as never)
+  await $.session.compact({ trigger: 'manual', instructions: 'keep the plan', messages: messages.slice(0, 4) } as never)
+  await $.session.compact({ trigger: 'auto', messages, agentId: 'a1' } as never)
+  expect(seen.instructions[0]?.startsWith('The last shell command in the conversation failed and nothing was committed after it (Bash: bun test tabs)')).toBe(true)
+  expect(seen.instructions[0]?.endsWith(transcriptSearch)).toBe(true)
+  expect(seen.instructions[1]).toBe(`keep the plan\n\n${openUserSteps}\n\n${transcriptSearch}`)
+  expect(seen.instructions[2]).toBe('')
 })
 
 test('pointer mode off: the same boundary compaction makes a summary', async ($, on) => {
