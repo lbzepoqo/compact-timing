@@ -19,7 +19,8 @@ const resumes = atom({ plugin: 'compact-timing', key: 'resumes' } as const, 0)
 const maxResumes = 10
 // The plugin's own `/compact` while it runs: `pending` until the compaction hook sees it, then its outcome. Its trigger
 // is `manual`, the same as a typed `/compact`, and the command's result says nothing about a skip.
-// `isPointer` when pointer mode answered in place of the summarizer.
+// `isPointer` when pointer mode answered in place of the summarizer; `summaryReason` when adaptive pointer mode made a
+// summary and added the pointer's parts after it.
 export type OwnCompact = State['ownCompact']
 const ownCompact = atom({ plugin: 'compact-timing', key: 'ownCompact' } as const, null as OwnCompact)
 // Pointer mode: what replaces the conversation at a `boundary` mark, stored before the plugin's `/compact` runs, since
@@ -66,18 +67,25 @@ export const shouldCompact = (current: Mark | null, tokens: number | undefined, 
 
 const thousands = (tokens: number) => `${Math.round(tokens / 1000)}k`
 
-const pointerFocus =
-  'what the next context must keep. At a `boundary` the plugin replaces the conversation with your focus, the requests the user typed, verbatim, `userSteps`, a digest of your work after the last commit (your messages, the tool calls, what failed), your last message, the files written, the uncommitted changes, the transcript path and the commits since the session started; no summary is made. Write it as a handoff: the goal, what is done, the next step, open decisions, what you ruled out and why, file paths. Without a focus the plugin makes a summary instead.'
+const pointerFocus = (isAdaptive: boolean) =>
+  `what the next context must keep. At a \`boundary\` the plugin replaces the conversation with your focus, the requests the user typed, verbatim, \`userSteps\`, a digest of your work after the last commit (your messages, the tool calls, what failed), your last message, the files written, the uncommitted changes, the transcript path and the commits since the session started; ${
+    isAdaptive
+      ? `no summary is made, unless the focus is missing or under ${minFocus} characters or your last shell command failed with an error and nothing committed after it: then a summary is made and those parts are added after it.`
+      : 'no summary is made.'
+  } Write it as a handoff: the goal, what is done, the next step, open decisions, what you ruled out and why, file paths.${isAdaptive ? '' : ' Without a focus the plugin makes a summary instead.'}`
 const pointerUserSteps =
   'with `boundary`: every step, command or question you gave the user that they have not yet reported done or answered: commands exactly, the rest briefly, with what each one is for. Steps in the message that ends the turn need not be listed: the pointer keeps that message.'
 
-/** The tool description: what the model reads about the marks. Pointer mode changes the focus and adds `userSteps`. */
-export const ruleText = (limits: Limits, isPointerMode = false) =>
+/**
+ * The tool description: what the model reads about the marks. Pointer mode changes the focus and adds `userSteps`;
+ * adaptive pointer mode says when a summary is made instead.
+ */
+export const ruleText = (limits: Limits, isPointerMode = false, isAdaptive = false) =>
   [
     'Sets the compaction mark for this conversation. The compact-timing plugin compacts at task boundaries instead of at a fixed token count.',
     `- \`boundary\`: call after a task or milestone whose state is saved outside the conversation (committed, or in a plan or notes file). The plugin compacts at the end of that turn when the context contains ${thousands(limits.boundaryTokens)} tokens or more. Either way the mark is dropped when the turn ends.`,
     '- `busy`: call before a step whose details exist only in the conversation, such as a debugging sequence or reading test output. The plugin does not compact while the mark is `busy`. Call with `boundary` when the step is done.',
-    isPointerMode ? `- \`focus\`: ${pointerFocus}` : '- `focus`: what the summary must keep: the next step, open decisions, file paths.',
+    isPointerMode ? `- \`focus\`: ${pointerFocus(isAdaptive)}` : '- `focus`: what the summary must keep: the next step, open decisions, file paths.',
     ...(isPointerMode ? [`- \`userSteps\`: ${pointerUserSteps}`] : []),
     '- `resume`: set it with `boundary` when steps of the current request remain. Then end the turn: the plugin compacts and sends the focus back as a prompt, so the work continues. The plugin can compact only between turns, so a long turn otherwise keeps growing.',
     `Without a mark the plugin compacts at ${thousands(limits.softTokens)} tokens. Any compaction clears the mark.`,
@@ -367,6 +375,12 @@ const noOutput = /^\(\w+ completed with no output\)$/
 
 /** A result with no output: a command that ran with `-q` or sent its output away. */
 const isSilent = (text: string) => text.trim() === '' || noOutput.test(text.trim())
+
+/**
+ * Whether a failed call's result says more than its exit code. A search that matched nothing, `test -f` or
+ * `git diff --quiet` fails with no text; a test run or a build that failed prints why.
+ */
+const hasErrorText = (text: string) => !isSilent(text.trim().replace(/^Exit code -?\d+\s*/, ''))
 
 // On Windows the model commits through either shell.
 const shellTools = ['Bash', 'PowerShell']
@@ -739,17 +753,19 @@ const maxCallsAfterFailure = 20
 /**
  * The last shell command, in one line, when it failed and at most maxCallsAfterFailure tool calls came after it; else
  * null. A commit is a shell command that did not fail, so nothing was committed after the one found. A search that
- * matched nothing fails too, so what a caller says about it is worded as a condition. Read from the end, since the
- * summary hook calls this on every compaction.
+ * matched nothing fails too, so what a caller says about it is worded as a condition, unless `withErrorText` asks only
+ * for a failure that printed more than its exit code. Read from the end, since the summary hook calls this on every
+ * compaction.
  */
-export const lastFailedShell = (messages: readonly WorkMessage[], toolName: string): string | null => {
+export const lastFailedShell = (messages: readonly WorkMessage[], toolName: string, withErrorText = false): string | null => {
   let laterCalls = 0
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]
     if (message?.role !== 'assistant') continue
     for (const use of [...(message.toolUses ?? [])].reverse()) {
       if (use.tool === toolName) continue
-      if (shellTools.includes(use.tool)) return use.isError === true ? clipEnd(callBrief(use).split('\n')[0] ?? '', 120) : null
+      if (shellTools.includes(use.tool))
+        return use.isError === true && (!withErrorText || hasErrorText(use.text ?? '')) ? clipEnd(callBrief(use).split('\n')[0] ?? '', 120) : null
       if (++laterCalls > maxCallsAfterFailure) return null
     }
   }
@@ -778,20 +794,56 @@ export const unfinishedStep = (messages: readonly WorkMessage[], toolName: strin
  * as good as its focus, and nothing after the compaction can ask for a better one. A second call replaces the mark, so
  * the advice says to repeat the other inputs.
  */
-export const pointerAdvice = (current: Mark, messages: readonly WorkMessage[], toolName: string): string[] => {
+export const pointerAdvice = (current: Mark, messages: readonly WorkMessage[], toolName: string, isAdaptive = false): string[] => {
   if (current.state !== 'boundary') return []
-  if (!current.focus) return ['Pointer mode: the mark has no focus, so the plugin will make a summary instead of a pointer. For a pointer, call again with a focus.']
+  if (!current.focus)
+    return [
+      isAdaptive
+        ? "Pointer mode: the mark has no focus, so the plugin will make a summary and add the pointer's parts after it. For a pointer alone, call again with a focus."
+        : 'Pointer mode: the mark has no focus, so the plugin will make a summary instead of a pointer. For a pointer, call again with a focus.',
+    ]
   const advice: string[] = []
+  // Adaptive pointer mode makes a summary for a failure that printed why, as `summaryReason` does.
+  const summarizedFailure = isAdaptive ? lastFailedShell(messages, toolName, true) : null
+  const fuller = `call again before you end the turn with a focus that covers the goal, what is done, the next step, open decisions and what you ruled out, and \`resume\` and \`userSteps\` as you gave them: a new call replaces the mark.`
   if (current.focus.length < minFocus)
     advice.push(
-      `Pointer mode: the focus is ${current.focus.length} characters, and it is all the next context gets from you about the goal, what is done, the next step, open decisions and what you ruled out. If it leaves one of those out, call again before you end the turn, with a fuller focus and \`resume\` and \`userSteps\` as you gave them: a new call replaces the mark.`,
+      !isAdaptive
+        ? `Pointer mode: the focus is ${current.focus.length} characters, and it is all the next context gets from you about the goal, what is done, the next step, open decisions and what you ruled out. If it leaves one of those out, call again before you end the turn, with a fuller focus and \`resume\` and \`userSteps\` as you gave them: a new call replaces the mark.`
+        : summarizedFailure === null
+          ? `Pointer mode: the focus is ${current.focus.length} characters, so the plugin will make a summary and add the pointer's parts after it. For a pointer alone, ${fuller}`
+          : `Pointer mode: the focus is ${current.focus.length} characters. If it leaves something out, ${fuller}`,
     )
-  const failed = lastFailedShell(messages, toolName)
-  if (failed !== null)
+  if (summarizedFailure !== null)
     advice.push(
-      `Pointer mode: your last shell command failed and nothing was committed after it (${failed}). The pointer keeps a digest of that work, not the full output. If the step is unfinished, call again with \`busy\` and go on with it; if it is finished, make sure the focus says what failed and why it no longer matters.`,
+      `Pointer mode: your last shell command failed and nothing was committed after it (${summarizedFailure}), so the plugin will make a summary that keeps that step and add the pointer's parts after it. If the step is unfinished, call again with \`busy\` and go on with it; if it is finished, say in the focus what failed and why it no longer matters.`,
     )
+  else {
+    const failed = lastFailedShell(messages, toolName)
+    if (failed !== null)
+      advice.push(
+        `Pointer mode: your last shell command failed and nothing was committed after it (${failed}). The pointer keeps a digest of that work, not the full output. If the step is unfinished, call again with \`busy\` and go on with it; if it is finished, make sure the focus says what failed and why it no longer matters.`,
+      )
+  }
   return advice
+}
+
+/**
+ * Adaptive pointer mode: why the plugin's boundary compaction makes a summary and adds the pointer's parts after it, or
+ * null for a pointer alone. A pointer is only as good as its focus, so a missing or thin one gets the summarizer, and so
+ * does an unfinished step: the last shell command failed with nothing committed after it, whose details a digest cuts.
+ * Only a failure that printed why counts: a search that matched nothing is no unfinished step.
+ */
+export const summaryReason = (focus: string, messages: readonly WorkMessage[], toolName: string): string | null => {
+  if (!focus) return 'the mark had no focus'
+  if (focus.length < minFocus) return `the focus was ${focus.length} characters`
+  try {
+    const failed = lastFailedShell(messages, toolName, true)
+    return failed === null ? null : `the last shell command failed and nothing was committed after it (${failed})`
+  } catch {
+    // A conversation of an unexpected shape: the focus is long enough for the pointer.
+    return null
+  }
 }
 
 /** The one user message that replaces the conversation in pointer mode. Its first line labels it, as summaryLabel does a summary. */
@@ -799,17 +851,31 @@ export const pointerText = (parts: PointerParts, reply: string, work: string) =>
   [
     `Compacted by the compact-timing plugin at ${thousands(parts.tokens)} tokens, at a \`boundary\` mark, in pointer mode: this message replaced the conversation, and no summary was made.`,
     `compact-timing: an automatic message from a plugin, not written by the user. You wrote the focus, the open steps and the last message; the plugin added the user\'s requests, the digest of your work, the files written${parts.uncommitted ? ', the uncommitted changes' : ''}, the transcript path and the commits.`,
-    `## Focus\n${parts.focus || 'None given.'}`,
-    `## The user's requests\nVerbatim, oldest first; a later request can change an earlier one.\n${parts.requests}`,
-    `## Open steps you gave the user\n${parts.userSteps || 'None listed.'}`,
-    work,
-    `## Your last message\n${reply || 'None found.'}`,
-    `## Files written this session with Write, Edit or NotebookEdit\nFiles changed through Bash are not listed.\n${parts.files}`,
-    // Left out where git answers neither question, as outside a repository: the commits part already says why.
-    ...(parts.uncommitted ? [`## Uncommitted changes\n${parts.uncommitted}`] : []),
-    `## Transcript\n${parts.transcriptPath}\nFor anything else from the conversation (requests left out above, error text, paths, numbers), ${transcriptSearchHow} Search it before asking the user for something they may already have given, and before acting on a command, an error or a value the focus names without giving it exactly.`,
-    `## Commits\n${parts.commits}`,
+    ...pointerSections(parts, [work, `## Your last message\n${reply || 'None found.'}`]),
   ].join('\n\n')
+
+/**
+ * Adaptive pointer mode: the message added after the summary. The summary covers the work and the last message, so
+ * those two parts are left out; the rest is what a summary paraphrases (the focus, the requests) or cannot know (git).
+ */
+export const handoffText = (parts: PointerParts, reason: string) =>
+  [
+    `compact-timing: an automatic message from a plugin, not written by the user. The plugin made the summary just before this message instead of a pointer because ${reason}, and added this message: the parts of the pointer a summary paraphrases or cannot know. You wrote the focus and the open steps; the plugin added the user's requests, the files written${parts.uncommitted ? ', the uncommitted changes' : ''}, the transcript path and the commits.`,
+    ...pointerSections(parts, []),
+  ].join('\n\n')
+
+/** The parts the pointer and the message after an adaptive summary share, with `middle` after the open steps. */
+const pointerSections = (parts: PointerParts, middle: readonly string[]) => [
+  `## Focus\n${parts.focus || 'None given.'}`,
+  `## The user's requests\nVerbatim, oldest first; a later request can change an earlier one.\n${parts.requests}`,
+  `## Open steps you gave the user\n${parts.userSteps || 'None listed.'}`,
+  ...middle,
+  `## Files written this session with Write, Edit or NotebookEdit\nFiles changed through Bash are not listed.\n${parts.files}`,
+  // Left out where git answers neither question, as outside a repository: the commits part already says why.
+  ...(parts.uncommitted ? [`## Uncommitted changes\n${parts.uncommitted}`] : []),
+  `## Transcript\n${parts.transcriptPath}\nFor anything else from the conversation (requests left out above, error text, paths, numbers), ${transcriptSearchHow} Search it before asking the user for something they may already have given, and before acting on a command, an error or a value the focus names without giving it exactly.`,
+  `## Commits\n${parts.commits}`,
+]
 
 /**
  * Instructions for every compaction of the main conversation: the ones given, or the mark's focus for a compaction
@@ -864,11 +930,14 @@ export const register: Register = (on, options) => {
   const isContextNoteOn = options.contextNote !== false
   // `plugin configure` stores the boolean even when `--values-stdin` gets the string "true".
   const isPointerMode = options.pointerMode === true
+  // On unless set to false: a thin focus or an unfinished step gets a summary with the pointer's parts after it. The
+  // engine refuses a value that is not a boolean, by the userConfig type.
+  const isAdaptive = isPointerMode && options.adaptivePointer !== false
 
   on('session.start', async ($, e, next) => {
     const registered = await $.tool.register({
       name: 'mark',
-      description: ruleText(limits, isPointerMode),
+      description: ruleText(limits, isPointerMode, isAdaptive),
       inputSchema: markSchema(isPointerMode),
       isDeferred: false,
     })
@@ -915,7 +984,7 @@ export const register: Register = (on, options) => {
       if (isPointerMark && tokens !== undefined && tokens >= limits.boundaryTokens) {
         try {
           // Without a focus the advice needs no messages.
-          advice = pointerAdvice(parsed, parsed.focus ? await $.session.messages() : [], markTool)
+          advice = pointerAdvice(parsed, parsed.focus ? await $.session.messages() : [], markTool, isAdaptive)
         } catch {
           advice = []
         }
@@ -993,8 +1062,9 @@ export const register: Register = (on, options) => {
           const path = await read($, transcriptPath)
           if (!path) {
             $.ui.log('compact-timing: pointer mode has no transcript path for this session, so this compaction makes a summary')
-          } else if (!marked.focus) {
-            // Without a focus the pointer would hold no goal and no next step: the summary keeps more.
+          } else if (!marked.focus && !isAdaptive) {
+            // Without a focus the pointer would hold no goal and no next step: the summary keeps more. Adaptive pointer
+            // mode makes that summary itself and adds the other parts after it.
             $.ui.log('compact-timing: the boundary mark has no focus, so this compaction makes a summary instead of a pointer')
           } else {
             const directory = await $.session.cwd()
@@ -1023,7 +1093,7 @@ export const register: Register = (on, options) => {
             }
           }
         } catch (error) {
-          report($, `compact-timing: pointer failed, making a summary (${error instanceof Error ? error.message : String(error)})`)
+          report($, `compact-timing: the pointer parts failed, making a plain summary (${error instanceof Error ? error.message : String(error)})`)
         }
       }
       if (isPointerMode) await update($, pointer, () => parts)
@@ -1045,7 +1115,9 @@ export const register: Register = (on, options) => {
       }
       const settled = outcome as OwnCompact
       const isPointer = typeof settled === 'object' && settled?.isPointer === true
-      if (parts !== null && !isPointer) $.ui.log('compact-timing: pointer mode fell back to a summary for this compaction')
+      const reason = typeof settled === 'object' ? settled?.summaryReason : undefined
+      if (reason) $.ui.log(`compact-timing: pointer mode made a summary and added the pointer's parts after it, because ${reason}`)
+      else if (parts !== null && !isPointer) $.ui.log('compact-timing: pointer mode fell back to a summary for this compaction')
       if (!decision.resume) return result
       let count = 0
       await update($, resumes, previous => (count = previous + 1))
@@ -1097,6 +1169,8 @@ export const register: Register = (on, options) => {
     // Pointer mode answers only the plugin's own `/compact` at a boundary: `pending` and the parts stored for it. Every
     // other compaction (a typed `/compact`, Claude Code's own, a subagent's) goes on to the summarizer.
     let pointed: SessionCompactResult | null = null
+    // Adaptive pointer mode: why a summary is made, and the message added after it.
+    let handoff: { reason: string; text: string } | null = null
     if (isPointerMode && e.agentId === undefined && e.trigger === 'manual') {
       const [own, parts, commits] = await Promise.all([
         read($, ownCompact).catch(() => null),
@@ -1105,20 +1179,35 @@ export const register: Register = (on, options) => {
       ])
       // A stored value of another shape finds no commit by the reflog rather than costing the digest.
       const committed = Array.isArray(commits) ? commits.filter(id => typeof id === 'string') : []
-      if (own === 'pending' && parts)
-        pointed = { messages: [{ role: 'user', text: pointerText(parts, lastReply(e.messages), workPart(e.messages, markTool, committed)), toolUses: [] }] }
+      if (own === 'pending' && parts) {
+        const reason = isAdaptive ? summaryReason(parts.focus, e.messages, markTool) : null
+        if (reason === null)
+          pointed = { messages: [{ role: 'user', text: pointerText(parts, lastReply(e.messages), workPart(e.messages, markTool, committed)), toolUses: [] }] }
+        else handoff = { reason, text: handoffText(parts, reason) }
+      }
     }
     // Another plugin's direct compaction carries its own instructions. This plugin's runs as `/compact` (`manual`).
     if (pointed === null && e.agentId === undefined && e.trigger !== 'plugin') {
       const current = await read($, mark).catch(() => null)
       e = { ...e, instructions: compactInstructions(e.trigger, e.instructions, current, unfinishedStep(e.messages, markTool)) }
     }
-    const result = pointed ?? (await next(e))
+    const summarized = pointed ?? (await next(e))
+    // A skipped summary gets nothing added. The handoff goes right after the summary, before any message the engine
+    // kept, which keep their handles and stand as the engine has them.
+    let summaryReasonAdded: string | undefined
+    let result = summarized
+    if (handoff !== null && summarized.skip === undefined) {
+      const [summary, ...kept] = summarized.messages
+      result = { ...summarized, messages: [...(summary ? [summary] : []), { role: 'user', text: handoff.text, toolUses: [] }, ...kept] }
+      summaryReasonAdded = handoff.reason
+    }
     if (e.agentId === undefined && e.trigger === 'manual') {
       const isPointer = pointed !== null
-      await update($, ownCompact, previous => (previous === 'pending' ? { skip: result.skip ?? null, ...(isPointer ? { isPointer } : {}) } : previous)).catch(
-        () => undefined,
-      )
+      await update($, ownCompact, previous =>
+        previous === 'pending'
+          ? { skip: result.skip ?? null, ...(isPointer ? { isPointer } : {}), ...(summaryReasonAdded ? { summaryReason: summaryReasonAdded } : {}) }
+          : previous,
+      ).catch(() => undefined)
     }
     // A compaction that replaces the conversation, also the automatic one at the hard limit, clears the mark.
     // A precompute installs nothing, so the mark stays.

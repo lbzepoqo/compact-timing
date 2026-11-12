@@ -89,6 +89,18 @@ Off by default. With `pointerMode` on, the plugin's compaction at a `boundary` m
 
 The message starts with "Compacted by the compact-timing plugin at 214k tokens, at a `boundary` mark, in pointer mode". A resume after it tells the model to continue from the focus and to check its last message, the commits and `git status` before repeating a step.
 
+### Adaptive: a summary when the pointer would be thin
+
+A pointer is only as good as its focus. With `adaptivePointer` on (the default in pointer mode), the plugin makes a summary instead when:
+
+- the mark has no focus;
+- the focus is under 200 characters;
+- the last shell command failed with error text, nothing was committed after it, and at most 20 tool calls followed it: an unfinished step whose details a digest cuts. A failure that printed only its exit code (a search that matched nothing, `test -f`, `git diff --quiet`) does not count; the pointer and the mark tool's answer still name it.
+
+The summarizer gets the focus and the request to keep the unfinished step, as any summary does, and the plugin adds one message right after the summary with the pointer's parts a summary paraphrases or cannot know: the focus as written, your requests verbatim, the open user steps, the files written, the uncommitted changes, the transcript path and the commits. The work digest and the last message are left out, since the summary covers them. The message says why a summary was made, and a transcript line says so too. A resume after it reads as after a summary. A summary that is skipped gets nothing added.
+
+This costs the summarizer's time and tokens only where the pointer would be weakest. Set `adaptivePointer` to false for a pointer at every `boundary` mark with a focus, as before 0.15.0.
+
 ### The work digest
 
 A pointer is only as good as its focus, and the model does not set `busy` during a debugging session (see [Results and limits](#results-and-limits)), so work that was never committed would otherwise be lost. The plugin therefore adds, from the conversation it is about to replace, what came after the last successful `git commit`:
@@ -122,14 +134,14 @@ One wrong guess is left: a command whose own commit failed quietly while somethi
 When a `boundary` mark can compact (the context is known to have reached `boundaryTokens`), the tool's answer adds, while the model still has the conversation:
 
 - with no focus: this compaction will make a summary, and a focus makes it a pointer;
-- with a focus under 200 characters: it is all the next context gets, so call again with a fuller one if it leaves something out, keeping `resume` and `userSteps`;
-- when the last shell command after the last commit failed: set `busy` if the step is unfinished, or say in the focus what failed.
+- with a focus under 200 characters: it is all the next context gets, so call again with a fuller one if it leaves something out, keeping `resume` and `userSteps`. In adaptive mode: a summary will be made, and a fuller focus makes it a pointer alone;
+- when the last shell command after the last commit failed: set `busy` if the step is unfinished, or say in the focus what failed. In adaptive mode: a summary that keeps the step will be made, and `busy` if the step is unfinished.
 
-Every other compaction still makes a summary: with no mark at `softTokens`, a `/compact` you type, Claude Code's own, and a subagent's. The plugin also falls back to a summary, with a transcript line saying so, when the mark has no focus or the transcript path is unknown. It learns the path from Claude Code's classic SessionStart and UserPromptSubmit events, since the plugin API has no other way to get it.
+Every other compaction still makes a summary: with no mark at `softTokens`, a `/compact` you type, Claude Code's own, and a subagent's. The plugin also falls back to a summary, with a transcript line saying so, when the transcript path is unknown, and with `adaptivePointer` off when the mark has no focus. It learns the path from Claude Code's classic SessionStart and UserPromptSubmit events, since the plugin API has no other way to get it.
 
 The requests and files are recorded as the session runs, because the plugin can read at most 4 MiB of a file and a long transcript is larger. They start from when pointer mode is on, so a session that was already running when you turned it on lacks the earlier ones, and a `/clear` empties them. A request is a prompt that counts as yours for the context note too: typed, from Remote Control or from an SDK host such as T3 Code. Slash commands and the plugin's own resume prompts are left out. An SDK host may also send messages from other sessions as prompts, and those are recorded as requests.
 
-The plugin answers the pointer compaction itself, so a compaction hook from another plugin that runs after compact-timing's does not run for it.
+The plugin answers the pointer compaction itself, so a compaction hook from another plugin that runs after compact-timing's does not run for it. An adaptive summary goes through those hooks as any summary does.
 
 ## Settings
 
@@ -139,6 +151,7 @@ The plugin answers the pointer compaction itself, so a compaction hook from anot
 | `softTokens` | 300000 | Context size at which the plugin compacts without a mark |
 | `contextNote` | true | Send the note on a prompt once the context reaches `boundaryTokens` |
 | `pointerMode` | false | At a `boundary` mark, replace the conversation with a pointer instead of a summary |
+| `adaptivePointer` | true | In pointer mode, make a summary with the pointer's parts after it when the focus is missing or under 200 characters, or the last shell command failed (see [Adaptive](#adaptive-a-summary-when-the-pointer-would-be-thin)) |
 
 Change them with `/plugin configure compact-timing@compact-timing` in Claude Code, or from the shell:
 
@@ -155,7 +168,7 @@ echo '{"boundaryTokens": "150000"}' | claude plugin configure compact-timing@com
 - **Headless sessions.** Before 0.9.1 the plugin never compacted in SDK sessions, and the only sign was a toast those hosts do not show. The `/compact` path is tested in an SDK session and in the terminal.
 - **Pointer mode.** Tested in two headless stream-json sessions with Haiku: 28k tokens became 0.4k in 5 ms with no summary request. With `resume`, Haiku checked `git status` and `git log`, then did the remaining step from the focus, but did not search the transcript for a command the focus only described. Not yet compared with summaries in daily use.
 - **Commit reminder, uncommitted changes and the shorter tool (0.12.0).** Tested in one headless session with Haiku: a commit, then a staged file and `git commit --dry-run`, then a `boundary` mark. The reminder came after the commit and not after the dry run, the pointer listed the staged file under the uncommitted changes, and Haiku still filled in `focus` and `userSteps` with their descriptions cut to one line. In pointer mode the tool's description and schema went from 2,990 to 2,454 characters, which every request carries. The request to keep an unfinished step in a summary is covered by unit tests only.
-- **Work digest and mark answer.** Tested in one headless session with Haiku: a commit, then a shell command that failed, then a `boundary` mark with a 28-character focus. The tool's answer named the short focus and the failed command, and the pointer's digest held only that command and its error, not the committed steps before it. Haiku ended the turn without writing a fuller focus, so the answer informs the model but does not make it act.
+- **Work digest and mark answer.** Tested in one headless session with Haiku: a commit, then a shell command that failed, then a `boundary` mark with a 28-character focus. The tool's answer named the short focus and the failed command, and the pointer's digest held only that command and its error, not the committed steps before it. Haiku ended the turn without writing a fuller focus, so the answer informs the model but does not make it act. Adaptive mode (0.15.0) answers that case with a summary, and is covered by unit tests only.
 - **Commits in daily use.** Counted over my own transcripts from 2026-09-21 to 2026-11-12: 1,303 shell commands held `git commit` as shell code and did not fail, and about 80% of all commit commands used `-q`. Git's commit line was in the output of only 3 of those that ran in a repository, so before the digest read the reflog it found almost no commit.
   - 955 ran in a session whose folder is a git repository with reflog entries going back to that time. The other 348 ran where the folder is not a repository (229) or before its oldest reflog entry (119).
   - 379 of the 955 committed in the session's folder itself, without `cd` or `git -C`. The reflog shows a commit made during 376 of them; the other 3 committed nothing.

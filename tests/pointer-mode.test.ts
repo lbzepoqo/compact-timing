@@ -11,6 +11,7 @@ import {
   compactInstructions,
   emptyRecord,
   filesText,
+  handoffText,
   isCommitCall,
   isCommitLogged,
   isQuietCommit,
@@ -28,6 +29,7 @@ import {
   requestsText,
   resumePrompt,
   ruleText,
+  summaryReason,
   transcriptSearch,
   transcriptSearchHow,
   uncommittedText,
@@ -46,6 +48,8 @@ const transcript = '/home/user/.claude/projects/repo/0b8e.jsonl'
 const markTool = 'mcp__compact-timing__mark'
 // 2026-11-12T08:00:00.000Z
 const startedAt = Date.UTC(2026, 10, 12, 8, 0)
+// Pointer mode without the adaptive summary, for the tests of what a pointer holds: most marks here have a short focus.
+const pointerOnly = { pointerMode: true, adaptivePointer: false }
 
 test('pointer mode adds userSteps to the tool and the rule; off, both stay as they were', () => {
   expect(ruleText(limits)).not.toContain('userSteps')
@@ -495,7 +499,17 @@ test('the resume prompt after a pointer does not speak of a summary', () => {
 const isReflogRead = (args: readonly string[]) => args[1] === 'reflog'
 
 // `gitFolders` holds the folder of each git run in `gitArgs`, undefined for the session folder.
-type Seen = { summarized: string[]; instructions: string[]; installed: string[]; prompts: string[]; gitArgs: string[][]; gitFolders: (string | undefined)[]; logs: string[] }
+// `added` holds the text of the messages after the first in each plugin compaction's result.
+type Seen = {
+  summarized: string[]
+  instructions: string[]
+  installed: string[]
+  added: string[]
+  prompts: string[]
+  gitArgs: string[][]
+  gitFolders: (string | undefined)[]
+  logs: string[]
+}
 type Overrides = {
   toolCall?: (input: Record<string, unknown>) => unknown
   isRepository?: boolean
@@ -507,6 +521,8 @@ type Overrides = {
   worktrees?: readonly string[]
   // The conversation the plugin's compaction replaces.
   messages?: unknown[]
+  // What the summarizer answers, in place of 'the summary'.
+  summary?: () => unknown
 }
 
 /**
@@ -515,7 +531,7 @@ type Overrides = {
  * what it was told, `installed` the first message of what each plugin compaction left.
  */
 const world = (on: On, $: Engine, tokens = 250_000, overrides: Overrides = {}): Seen => {
-  const seen: Seen = { summarized: [], instructions: [], installed: [], prompts: [], gitArgs: [], gitFolders: [], logs: [] }
+  const seen: Seen = { summarized: [], instructions: [], installed: [], added: [], prompts: [], gitArgs: [], gitFolders: [], logs: [] }
   on('classic.SessionStart', () => ({}) as never)
   on('classic.UserPromptSubmit', () => ({}) as never)
   on('session.end', (_, e) => ({ sessionId: e.sessionId }) as never)
@@ -552,7 +568,7 @@ const world = (on: On, $: Engine, tokens = 250_000, overrides: Overrides = {}): 
   on('session.compact', (_, e) => {
     seen.summarized.push(e.trigger)
     seen.instructions.push(e.instructions ?? '')
-    return { messages: [{ role: 'user', text: 'the summary', toolUses: [] }] }
+    return (overrides.summary?.() ?? { messages: [{ role: 'user', text: 'the summary', toolUses: [] }] }) as never
   })
   on('command.run', async (_, e) => {
     if (e.command === 'compact') {
@@ -565,6 +581,7 @@ const world = (on: On, $: Engine, tokens = 250_000, overrides: Overrides = {}): 
         ],
       } as never)
       seen.installed.push(result.messages?.[0]?.text ?? `skip: ${result.skip}`)
+      seen.added.push((result.messages ?? []).slice(1).map(message => message.text).join('\n\n'))
     }
     return {} as never
   })
@@ -590,7 +607,7 @@ const setMark = ($: Engine, input: Record<string, unknown>) => $.tool.call({ too
 const markAnswer = async ($: Engine, input: Record<string, unknown>) => String((await setMark($, input) as { result?: unknown }).result)
 const endTurn = ($: Engine) => $.turn.complete({ reason: 'answer', answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't1' })
 
-test('pointer mode: the plugin compaction at a boundary replaces the conversation without the summarizer', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: the plugin compaction at a boundary replaces the conversation without the summarizer', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $)
   await start($)
   await setMark($, { state: 'boundary', focus: 'Next: deploy.', userSteps: 'Run `make test`.', resume: true })
@@ -613,7 +630,7 @@ test('pointer mode: the plugin compaction at a boundary replaces the conversatio
   expect(seen.prompts[0]).toContain('replaced the conversation with a pointer')
 })
 
-test('pointer mode: outside a repository the pointer says so once and has no uncommitted part', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: outside a repository the pointer says so once and has no uncommitted part', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $, 250_000, { isRepository: false })
   await start($)
   await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
@@ -624,7 +641,7 @@ test('pointer mode: outside a repository the pointer says so once and has no unc
   expect(pointer).toContain('the files written, the transcript path and the commits.')
 })
 
-test('pointer mode: a repository without a commit still lists the uncommitted changes', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: a repository without a commit still lists the uncommitted changes', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $, 250_000, { hasCommits: false })
   await start($)
   await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
@@ -729,7 +746,7 @@ const reflogWorld = (
   return { seen, run, use, compact }
 }
 
-test('pointer mode: a quiet commit in HEAD\'s reflog starts the digest after it, one a hook rejected does not', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: a quiet commit in HEAD\'s reflog starts the digest after it, one a hook rejected does not', { options: pointerOnly }, async ($, on) => {
   const quiet = 'git commit -qm "Fix the parser" && git checkout -q main'
   const rejected = 'git commit -q -m "Fix the lexer"; git log --oneline -1'
   const session = reflogWorld(on, $, { commits: { [quiet]: ['commit: Fix the parser', 'checkout: moving from fix to main'] } })
@@ -755,7 +772,7 @@ test('pointer mode: a quiet commit in HEAD\'s reflog starts the digest after it,
   expect(pointer).toContain('lint failed')
 })
 
-test('pointer mode: the reflog finds no commit for a rebase, no answer, a failed, denied or background call, or a subagent', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: the reflog finds no commit for a rebase, no answer, a failed, denied or background call, or a subagent', { options: pointerOnly }, async ($, on) => {
   let isAnswering = true
   const commands = {
     rebase: 'git commit -qm x; git pull --rebase',
@@ -902,7 +919,7 @@ test('a commit in another worktree is this command\'s only when its subject is t
   expect(isCommitLogged(reflog('commit: Other session work'), now * 1000, now * 1000 + 500)).toBe(true)
 })
 
-test('pointer mode: a quiet commit in another worktree the command names counts, one in a worktree it only reads in does not', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: a quiet commit in another worktree the command names counts, one in a worktree it only reads in does not', { options: pointerOnly }, async ($, on) => {
   mock.env(on, { HOME: '/home/ada' })
   const named = 'cd ~/repo-worktrees/fix && git commit -qm "Fix the parser"'
   // A commit a hook rejected, while another session commits in a worktree the command reads a file of.
@@ -941,7 +958,7 @@ test('pointer mode: a quiet commit in another worktree the command names counts,
   expect(pointer).toContain('You: Fixing the lexer.')
 })
 
-test('pointer mode: a /clear empties the record of commits', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: a /clear empties the record of commits', { options: pointerOnly }, async ($, on) => {
   const before = 'git commit -qm before'
   const after = 'git commit -qm after'
   const session = reflogWorld(on, $, { commits: { [before]: ['commit: before'], [after]: ['commit: after'] } })
@@ -957,7 +974,7 @@ test('pointer mode: a /clear empties the record of commits', { options: { pointe
   expect(pointer).toContain(`## Your work after the last commit\nA digest the plugin made, oldest first: what you said, each tool call, the end of a shell output, the text of a failure and the start and end of other results. Results of file reads, searches and edits are left out.\nBash: ${before}`)
 })
 
-test('pointer mode: the record of commits keeps the newest 200', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: the record of commits keeps the newest 200', { options: pointerOnly }, async ($, on) => {
   const commands = Array.from({ length: 201 }, (_, index) => `git commit -qm c${index}`)
   const session = reflogWorld(on, $, { commits: Object.fromEntries(commands.map(command => [command, [`commit: ${command}`]])) })
   await start($)
@@ -972,7 +989,7 @@ test('pointer mode: the record of commits keeps the newest 200', { options: { po
   expect(pointer).toContain(`Bash: ${commands[0]}`)
 })
 
-test('pointer mode: the reminder follows a commit whose own output was sent away when the reflog shows it', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: the reminder follows a commit whose own output was sent away when the reflog shows it', { options: pointerOnly }, async ($, on) => {
   const session = reflogWorld(on, $, {
     commits: { 'git commit -m x >/dev/null && git log -1': ['commit: x'] },
     result: () => ({ result: 'ok', text: 'commit 5815a99\nAuthor: Ada\n\n    x' }),
@@ -1010,7 +1027,7 @@ test('pointer mode off: the same boundary compaction makes a summary', async ($,
   expect(seen.gitArgs).toEqual([])
 })
 
-test('pointer mode: no mark at the soft limit makes a summary', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: no mark at the soft limit makes a summary', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $, 310_000)
   await start($)
   await endTurn($)
@@ -1018,7 +1035,7 @@ test('pointer mode: no mark at the soft limit makes a summary', { options: { poi
   expect(seen.installed).toEqual(['the summary'])
 })
 
-test('pointer mode: without a transcript path the boundary compaction makes a summary', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: without a transcript path the boundary compaction makes a summary', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $)
   await start($, '')
   await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
@@ -1027,7 +1044,7 @@ test('pointer mode: without a transcript path the boundary compaction makes a su
   expect(seen.logs.some(line => line.includes('no transcript path'))).toBe(true)
 })
 
-test('pointer mode: a boundary without a focus makes a summary', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: a boundary without a focus makes a summary', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $)
   await start($)
   await setMark($, { state: 'boundary', userSteps: 'Run `make test`.' })
@@ -1037,7 +1054,7 @@ test('pointer mode: a boundary without a focus makes a summary', { options: { po
   expect(seen.logs.some(line => line.includes('has no focus'))).toBe(true)
 })
 
-test('pointer mode: Claude Code compactions, a typed /compact and a subagent keep the summary', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: Claude Code compactions, a typed /compact and a subagent keep the summary', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $)
   await start($)
   await setMark($, { state: 'busy', focus: 'Keep the failing test name.' })
@@ -1053,7 +1070,7 @@ test('pointer mode: Claude Code compactions, a typed /compact and a subagent kee
 const prompt = ($: Engine, text: string, origin = 'sdk', extra: Record<string, unknown> = {}) =>
   $.prompt.submit({ text, wait: false, origin: { kind: origin }, ...extra } as never)
 
-test('pointer mode: the pointer quotes the user\'s requests and lists the files written', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: the pointer quotes the user\'s requests and lists the files written', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $)
   await start($)
   await prompt($, 'Fix the parser in src/parse.ts', 'composer')
@@ -1076,7 +1093,7 @@ test('pointer mode: the pointer quotes the user\'s requests and lists the files 
   expect(pointer).not.toContain('/repo/x.ts')
 })
 
-test('pointer mode: a /clear starts the record over', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: a /clear starts the record over', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $)
   await start($)
   await prompt($, 'Old task')
@@ -1093,7 +1110,7 @@ test('pointer mode: a /clear starts the record over', { options: { pointerMode: 
   expect(pointer).toContain('## Transcript\n/home/user/.claude/projects/repo/new.jsonl')
 })
 
-test('pointer mode: the mark answer carries the advice only when the mark can compact', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: the mark answer carries the advice only when the mark can compact', { options: pointerOnly }, async ($, on) => {
   world(on, $)
   on('session.messages', () => ({ value: session }) as never)
   await start($)
@@ -1104,7 +1121,7 @@ test('pointer mode: the mark answer carries the advice only when the mark can co
   expect(await markAnswer($, { state: 'busy', focus: 'Next: deploy.' })).toBe('The mark is `busy`.')
 })
 
-test('pointer mode: below boundaryTokens the mark answer has no advice', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: below boundaryTokens the mark answer has no advice', { options: pointerOnly }, async ($, on) => {
   world(on, $, 50_000)
   on('session.messages', () => ({ value: session }) as never)
   await start($)
@@ -1118,7 +1135,7 @@ test('pointer mode off: the mark answer has no advice', async ($, on) => {
   expect(await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })).toBe('The mark is `boundary`.')
 })
 
-test('pointer mode: when the messages cannot be read the mark is still set', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: when the messages cannot be read the mark is still set', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $)
   on('session.messages', () => {
     throw new Error('no transcript')
@@ -1129,11 +1146,155 @@ test('pointer mode: when the messages cannot be read the mark is still set', { o
   expect(seen.installed[0]).toContain('## Your work since the conversation started or was last compacted\n')
 })
 
-test('pointer mode: at an unknown size the mark answer has no advice', { options: { pointerMode: true } }, async ($, on) => {
+test('pointer mode: at an unknown size the mark answer has no advice', { options: pointerOnly }, async ($, on) => {
   world(on, $, -1)
   on('session.messages', () => ({ value: session }) as never)
   await start($)
   const answer = await markAnswer($, { state: 'boundary', focus: 'Next: deploy.', resume: true })
   expect(answer).toContain('size unknown')
   expect(answer).not.toContain('Pointer mode')
+})
+
+// `session` as the engine hands it over, each tool call with an id.
+const engineSession = session.map((message, index) => ({
+  ...message,
+  toolUses: (message.toolUses ?? []).map((use, useIndex) => ({ tool_use_id: `toolu_${index}_${useIndex}`, ...use })),
+}))
+
+// A focus of more than 200 characters, which adaptive pointer mode takes for a handoff.
+const fullFocus =
+  'Goal: tabs parse as spaces. Done: the parser fix, committed. Next: change the lexer in src/lex.ts so the tab test passes. Open: whether a tab counts as one column or eight. Ruled out: the parser, which never sees tabs.'
+
+test('adaptive pointer mode makes a summary for no focus, a thin one or a failed last command', () => {
+  expect(summaryReason('', session, markTool)).toBe('the mark had no focus')
+  expect(summaryReason('Next: deploy.', session, markTool)).toBe('the focus was 13 characters')
+  expect(summaryReason(fullFocus, session, markTool)).toBe('the last shell command failed and nothing was committed after it (Bash: bun test tabs)')
+  expect(summaryReason(fullFocus, session.slice(0, 4), markTool)).toBeNull()
+  expect(summaryReason(fullFocus, [{ role: 'assistant', text: '', toolUses: [null as never] }], markTool)).toBeNull()
+})
+
+test('the message after an adaptive summary holds the pointer parts but not the work or the last message', () => {
+  const parts = {
+    tokens: 214_000,
+    focus: 'Next: deploy.',
+    userSteps: 'Run `make test`.',
+    requests: '- Fix the parser',
+    files: '/repo/parser.ts',
+    uncommitted: ' M src/lex.ts',
+    transcriptPath: transcript,
+    commits: 'None in /repo since x.',
+  }
+  const text = handoffText(parts, 'the focus was 13 characters')
+  expect(text.split('\n')[0]).toContain('made the summary just before this message instead of a pointer because the focus was 13 characters')
+  expect(text).toContain('not written by the user')
+  expect(text).toContain('## Focus\nNext: deploy.')
+  expect(text).toContain("## The user's requests\nVerbatim")
+  expect(text).toContain('## Open steps you gave the user\nRun `make test`.\n\n## Files written')
+  expect(text).toContain('## Uncommitted changes\n M src/lex.ts')
+  expect(text).toContain(`## Transcript\n${transcript}\n`)
+  expect(text).toContain('## Commits\nNone in /repo since x.')
+  expect(text).not.toContain('## Your work')
+  expect(text).not.toContain('## Your last message')
+  // The pointer has the same parts, with the work and the last message after the open steps.
+  expect(pointerText(parts, 'r', '## Your work\nw')).toContain(text.slice(text.indexOf('## Focus'), text.indexOf('## Files written')).replace('\n\n## Files', '').trimEnd())
+})
+
+test('adaptive pointer mode says when it makes a summary, in the tool and in the mark advice', () => {
+  expect(ruleText(limits, true, true)).toContain('no summary is made, unless the focus is missing or under 200 characters or your last shell command failed with an error')
+  expect(ruleText(limits, true)).toContain('Without a focus the plugin makes a summary instead.')
+  expect(pointerAdvice({ state: 'boundary', focus: '' }, session, markTool, true)[0]).toContain("make a summary and add the pointer's parts after it")
+  const thin = pointerAdvice({ state: 'boundary', focus: 'Next: deploy.' }, session.slice(0, 4), markTool, true)
+  expect(thin).toEqual([expect.stringContaining('the focus is 13 characters, so the plugin will make a summary')])
+  const failed = pointerAdvice({ state: 'boundary', focus: fullFocus }, session, markTool, true)
+  expect(failed).toEqual([expect.stringContaining('(Bash: bun test tabs), so the plugin will make a summary that keeps that step')])
+  expect(pointerAdvice({ state: 'boundary', focus: fullFocus }, session.slice(0, 4), markTool, true)).toEqual([])
+})
+
+test('adaptive pointer mode: a thin focus makes a summary with the pointer parts after it', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $)
+  await start($)
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.', userSteps: 'Run `make test`.', resume: true })
+  await endTurn($)
+  expect(seen.summarized).toEqual(['manual'])
+  expect(seen.instructions[0]).toContain('Next: deploy.')
+  expect(seen.installed).toEqual(['the summary'])
+  expect(seen.added[0]).toContain('because the focus was 13 characters')
+  expect(seen.added[0]).toContain('## Open steps you gave the user\nRun `make test`.')
+  expect(seen.added[0]).toContain('## Uncommitted changes\n2 in /repo')
+  expect(seen.added[0]).toContain('abc123 2026-11-12 09:00 Fix the parser')
+  expect(seen.logs).toContain("compact-timing: pointer mode made a summary and added the pointer's parts after it, because the focus was 13 characters")
+  expect(seen.logs.some(line => line.includes('fell back'))).toBe(false)
+  // A summary was made, so the resume prompt speaks of it.
+  expect(seen.prompts[0]).toContain('The summary is newer than this focus')
+})
+
+test('adaptive pointer mode: a full focus after committed work makes a pointer alone', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $, 250_000, { messages: engineSession.slice(0, 4) })
+  await start($)
+  await setMark($, { state: 'boundary', focus: fullFocus })
+  await endTurn($)
+  expect(seen.summarized).toEqual([])
+  expect(seen.installed[0]).toContain('in pointer mode')
+  expect(seen.added).toEqual([''])
+})
+
+test('adaptive pointer mode: a failed last command makes a summary that keeps the step', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $, 250_000, { messages: engineSession })
+  await start($)
+  await setMark($, { state: 'boundary', focus: fullFocus })
+  await endTurn($)
+  expect(seen.summarized).toEqual(['manual'])
+  expect(seen.instructions[0]).toContain('The last shell command in the conversation failed')
+  expect(seen.added[0]).toContain('because the last shell command failed and nothing was committed after it (Bash: bun test tabs)')
+  expect(seen.added[0]).toContain(`## Focus\n${fullFocus}`)
+})
+
+test('adaptive pointer mode: no focus still adds the pointer parts after the summary', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $)
+  await start($)
+  await setMark($, { state: 'boundary', userSteps: 'Run `make test`.' })
+  await endTurn($)
+  expect(seen.summarized).toEqual(['manual'])
+  expect(seen.added[0]).toContain('because the mark had no focus')
+  expect(seen.added[0]).toContain('## Focus\nNone given.')
+  expect(seen.added[0]).toContain('## Open steps you gave the user\nRun `make test`.')
+  expect(seen.logs.some(line => line.includes('has no focus, so this compaction makes a summary'))).toBe(false)
+})
+
+test('adaptive pointer mode: a skipped summary gets nothing added', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $, 250_000, { summary: () => ({ skip: 'blocked by a hook' }) })
+  await start($)
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
+  await endTurn($)
+  expect(seen.installed).toEqual(['skip: blocked by a hook'])
+  expect(seen.added).toEqual([''])
+  expect(seen.logs.some(line => line.includes('compaction skipped (blocked by a hook)'))).toBe(true)
+})
+
+test('adaptive pointer mode: a failure with no error text, such as a search that matched nothing, keeps the pointer', () => {
+  const searched = [...session.slice(0, 4), { role: 'assistant' as const, text: '', toolUses: [shell('grep -q TODO src/x.ts', 'Exit code 1', true)] }]
+  expect(summaryReason(fullFocus, searched, markTool)).toBeNull()
+  // The advice still names it, worded as a condition, as without adaptive mode.
+  const advice = pointerAdvice({ state: 'boundary', focus: fullFocus }, searched, markTool, true)
+  expect(advice).toEqual([expect.stringContaining('The pointer keeps a digest of that work')])
+  expect(summaryReason(fullFocus, [...session.slice(0, 4), { role: 'assistant' as const, text: '', toolUses: [shell('bun test', 'Exit code 1\n1 fail', true)] }], markTool)).toContain('(Bash: bun test)')
+})
+
+test('adaptive advice for a thin focus and a failed command does not promise a pointer for a fuller focus', () => {
+  const advice = pointerAdvice({ state: 'boundary', focus: 'Next: deploy.' }, session, markTool, true)
+  expect(advice.length).toBe(2)
+  expect(advice[0]).not.toContain('pointer alone')
+  expect(advice[1]).toContain('so the plugin will make a summary that keeps that step')
+  expect(ruleText(limits, true, true)).not.toContain('no summary is made.')
+})
+
+test('adaptive pointer mode: the handoff goes right after the summary, before the messages the engine kept', { options: { pointerMode: true } }, async ($, on) => {
+  const seen = world(on, $, 250_000, {
+    summary: () => ({ messages: [{ role: 'user', text: 'the summary', toolUses: [] }, { role: 'user', text: 'a kept file', toolUses: [] }] }),
+  })
+  await start($)
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
+  await endTurn($)
+  expect(seen.added[0]?.startsWith('compact-timing: an automatic message')).toBe(true)
+  expect(seen.added[0]?.endsWith('a kept file')).toBe(true)
 })
