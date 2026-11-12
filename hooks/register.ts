@@ -296,8 +296,8 @@ export const register: Register = (on, options) => {
   }
   let markTool = 'mcp__compact-timing__mark'
   const isContextNoteOn = options.contextNote !== false
-  // Also the string, as `--values-stdin` takes values (see the README's example).
-  const isPointerMode = options.pointerMode === true || options.pointerMode === 'true'
+  // `plugin configure` stores the boolean even when `--values-stdin` gets the string "true".
+  const isPointerMode = options.pointerMode === true
 
   on('session.start', async ($, e, next) => {
     const registered = await $.tool.register({
