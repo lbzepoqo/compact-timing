@@ -152,14 +152,20 @@ claude plugin install compact-timing-code-mode@compact-timing
 claude plugin disable compact-timing@compact-timing
 ```
 
-Install one of the two plugins, not both: with `compact-timing` enabled Code Mode stays off, and both would compact. The Code Mode plugin listens to no tool event, so Code Mode stays on. What differs:
+If you installed `compact-timing` from the `lbzepoqo/claude-plugins` marketplace, disable `compact-timing@lbzepoqo` instead. Keep one of the two plugins enabled, not both: with `compact-timing` enabled Code Mode stays off, and both would compact. The Code Mode plugin listens to no tool event, so Code Mode stays on. What differs:
 
-- **A skill instead of a tool.** The model sets the mark with the `compact-timing-code-mode:mark` skill. Its arguments are lines: the first is `boundary`, `boundary resume` or `busy`, and the focus goes on the lines after it. The plugin answers the skill in its `skill.prompt` hook, so the model reads the plugin's answer (the mark set, and whether to end the turn now) instead of the skill's text. A subagent's call sets no mark.
-- **Reminders as text.** The commit reminder and the size nudge are added to the result of the shell call the model made itself. A call the model's JavaScript made in Code Mode is recorded only after the script ran, with no output, so its reminder comes as a separate note in the conversation.
+- **A skill instead of a tool.** The model sets the mark with the `compact-timing-code-mode:mark` skill. Its arguments are lines: the first is `boundary`, `boundary resume` or `busy`, and the focus goes on the lines after it. The plugin answers the skill in its `skill.prompt` hook, so the model reads the plugin's answer (the mark set, and whether to end the turn now) instead of the skill's text.
+- **Reminders as text.** The commit reminder and the size nudge are added to the result of the shell call the model made itself. A call the model's JavaScript made in Code Mode is recorded only after the script ran, with no output, so its reminder comes as a separate note, and whether it committed is read from HEAD's reflog (`git reflog`) since the script started.
+- **Subagents.** The skill's hook isn't told which agent called it, so the plugin records each call that may run the skill, with whose it is, and matches the skill's arguments to them. A subagent's call sets no mark.
 - **No pointer mode.** The work digest needs each call's output, which those recorded calls don't hold. Every compaction is a summary, with the same instructions as `compact-timing`'s.
 - **Settings:** `boundaryTokens`, `softTokens` and `contextNote`, as below, under `compact-timing-code-mode@compact-timing`.
 
-Tested with Claude Code 2.1.325 and Sonnet in the terminal, once with Code Mode on and once with it off. Both times the commit reminder reached the model, and after a `boundary resume` call of the skill the plugin ran `/compact` at the end of the turn and sent the focus back as a prompt, and the model did the remaining step. The test prompt told the model to call the skill, so it does not show how often the model calls it unprompted. Code Mode runs only in an interactive terminal, so SDK and headless sessions were not tested. The skill's arguments arrive as written, except that the engine turns a line that starts with `!` into `\! `; the plugin undoes that.
+Tested with Claude Code 2.1.325 and Sonnet in the terminal. Both plugins install from this repo's marketplace; the installed `compact-timing` lists no skill and still adds its `mark` tool. The runs below loaded the plugin with `--plugin-dir`, the subagent one from the installed copy:
+
+- With Code Mode on and with it off, the commit reminder reached the model, and after a `boundary resume` call of the skill the plugin ran `/compact` at the end of the turn and sent the focus back as a prompt; the model did the remaining step. The prompt told the model to call the skill, so this does not show how often it calls it unprompted.
+- In Code Mode, a subagent's call of the skill was refused and nothing compacted; a call from the main conversation in the same session set the mark.
+- In Code Mode, a `git commit` with nothing staged got no reminder, a commit that worked got it, and the size nudge came at `softTokens`.
+- Code Mode runs only in an interactive terminal, so SDK and headless sessions were not tested. The skill's arguments arrive as written, except that the engine turns a line that starts with `!` into `\! `; the plugin undoes that.
 
 ## Settings
 

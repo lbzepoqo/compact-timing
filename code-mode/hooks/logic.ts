@@ -969,8 +969,8 @@ export const parseMarkArgs = (skillText: string): Mark | null => {
 
 /**
  * A call that may run the mark skill, from the model row that holds it: a direct `Skill` call with its arguments, or
- * Code Mode JavaScript that names the skill, whose arguments the plugin can't read from the code. `isSubagent` is what
- * the skill's own hook can't tell, since it gets no agent id.
+ * Code Mode JavaScript that calls `tools.Skill` with the skill's name, whose arguments the plugin can't read from the
+ * code. `isSubagent` is what the skill's own hook can't tell, since it gets no agent id.
  */
 export type MarkCall = { isSubagent: boolean; args?: string }
 
@@ -983,15 +983,22 @@ export const markCallOf = (use: { [field: string]: unknown }, isSubagent: boolea
   const input = (use.input ?? {}) as Record<string, unknown>
   if (use.name === 'Skill' && input.skill === markSkill)
     return { isSubagent, args: typeof input.args === 'string' ? input.args.replace(/\r\n?/g, '\n').trim() : '' }
-  if (use.name === 'REPL' && typeof input.code === 'string' && input.code.includes(markSkill)) return { isSubagent }
+  // Naming the skill is not enough: a script that starts a subagent names it in the subagent's prompt.
+  if (use.name === 'REPL' && typeof input.code === 'string' && input.code.includes('tools.Skill') && input.code.includes(markSkill))
+    return { isSubagent }
   return null
 }
 
 /**
- * Which pending call ran the skill with these arguments: the oldest direct call with the same arguments, else the
- * oldest JavaScript call that names the skill. -1 when none fits, as when the user typed the skill.
+ * Which pending call ran the skill with these arguments: the newest direct call with the same arguments, else the
+ * newest JavaScript call that calls the skill. Newest, since a script that starts a subagent runs until the subagent's
+ * own script, which called the skill, is done. -1 when none fits, as when the user typed the skill.
  */
 export const matchMarkCall = (pending: readonly MarkCall[], args: string): number => {
-  const direct = pending.findIndex(call => call.args === args)
-  return direct !== -1 ? direct : pending.findIndex(call => call.args === undefined)
+  let script = -1
+  for (let index = pending.length - 1; index >= 0; index--) {
+    if (pending[index]?.args === args) return index
+    if (script === -1 && pending[index]?.args === undefined) script = index
+  }
+  return script
 }

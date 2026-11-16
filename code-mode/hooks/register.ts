@@ -7,6 +7,7 @@ import {
   contextNote,
   contextNoteDue,
   isCommitCall,
+  isCommitFound,
   isRemindableCommit,
   limitOption,
   markArgsText,
@@ -47,6 +48,7 @@ const resumes = atom({ plugin: 'compact-timing-code-mode', key: 'resumes' } as c
 const ownCompact = atom({ plugin: 'compact-timing-code-mode', key: 'ownCompact' } as const, null as OwnCompact)
 const commands = atom({ plugin: 'compact-timing-code-mode', key: 'commands' } as const, {} as Record<string, { tool: string; command: string }>)
 const markCalls = atom({ plugin: 'compact-timing-code-mode', key: 'markCalls' } as const, [] as MarkCall[])
+const scriptStartedAt = atom({ plugin: 'compact-timing-code-mode', key: 'scriptStartedAt' } as const, 0)
 
 // The atoms check that the logic's shapes fit the stored ones; these check the other way, so neither can drift.
 type Stored = PluginState['compact-timing-code-mode']
@@ -86,6 +88,8 @@ export const register: Register = (on, options) => {
       const isSubagent = e.agentId !== undefined
       const calls = uses.flatMap(use => markCallOf(use, isSubagent) ?? [])
       if (calls.length > 0) await update($, markCalls, previous => [...previous, ...calls].slice(-maxMarkCalls)).catch(() => undefined)
+      if (!isSubagent && uses.some(use => use.name === 'REPL' && !String(use.id).startsWith('repl_')))
+        await update($, scriptStartedAt, () => Date.now()).catch(() => undefined)
       const commits = isSubagent
         ? []
         : uses.flatMap(use => {
@@ -121,9 +125,15 @@ export const register: Register = (on, options) => {
       ])
       let isResumeReminded = false
       for (const [block, call] of calls) {
-        if (block.is_error === true) continue
+        if (block.is_error === true || !shouldRemind(current, tokens, limits)) continue
         const input = { command: call.command }
-        if (isRemindableCommit(call.tool, input, resultText(block.content), current) && shouldRemind(current, tokens, limits)) {
+        // A call a script made is recorded with no output, so whether it committed is read from HEAD's reflog, from
+        // when the script started. Under a `busy` mark the words are enough, as with a direct call.
+        // Without a start time (a script the plugin did not see start) the words decide, as for a silent direct call.
+        const startedAt = String(block.tool_use_id).startsWith('repl_') && current?.state !== 'busy' ? await read($, scriptStartedAt).catch(() => 0) : 0
+        const isCommitted =
+          startedAt > 0 ? await isCommitFound($, call.command, startedAt) : isRemindableCommit(call.tool, input, resultText(block.content), current)
+        if (isCommitted) {
           add(block, commitReminder(markSkillName, current, skillAddResume))
           // Only the reminder for a mark that is not busy names `resume`, so only it says what the nudge says.
           isResumeReminded ||= current?.state !== 'busy'

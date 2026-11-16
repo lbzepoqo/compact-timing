@@ -35,17 +35,25 @@ test('a call that may run the skill is recorded with whose it is, and matched by
   expect(markCallOf({ id: 'toolu_4', name: 'Skill', input: { skill: 'other:mark', args: 'busy' } }, false)).toBe(null)
   expect(markCallOf({ id: 'repl_5', name: 'Skill', input: { skill: markSkill, args: 'busy' } }, false)).toBe(null)
 
-  const pending = [{ isSubagent: true }, { isSubagent: false, args: 'boundary\nmain' }, { isSubagent: true, args: 'busy' }]
-  expect(matchMarkCall(pending, 'boundary\nmain')).toBe(1)
-  expect(matchMarkCall(pending, 'boundary\nwritten in JavaScript')).toBe(0)
+  // A script that starts a subagent names the skill in the subagent's prompt, without calling it.
+  expect(markCallOf({ id: 'toolu_6', name: 'REPL', input: { code: `await tools.Agent({ prompt: 'call ${markSkill}' })` } }, false)).toBe(null)
+
+  const pending = [{ isSubagent: false }, { isSubagent: true }, { isSubagent: false, args: 'boundary\nmain' }, { isSubagent: true, args: 'busy' }]
+  expect(matchMarkCall(pending, 'boundary\nmain')).toBe(2)
+  // The newest script: the main one that started a subagent runs until the subagent's script is done.
+  expect(matchMarkCall(pending, 'boundary\nwritten in JavaScript')).toBe(1)
   expect(matchMarkCall([{ isSubagent: false, args: 'busy' }], 'boundary')).toBe(-1)
   expect(matchMarkCall([], 'busy')).toBe(-1)
 })
 
-type Seen = { compacts: string[]; notes: string[]; prompts: string[] }
+// A line of `git reflog --date=unix --format=%gd%x09%gs`, made now unless a time is given.
+const entry = (subject: string, time = Math.floor(Date.now() / 1000)) => `HEAD@{${time}}\t${subject}`
+
+// `reflog`: HEAD's reflog, newest first, as `git reflog` prints it; a test adds to it when its command commits.
+type Seen = { compacts: string[]; notes: string[]; prompts: string[]; reflog: string[] }
 
 const world = (on: On, $: Engine, tokens: number): Seen => {
-  const seen: Seen = { compacts: [], notes: [], prompts: [] }
+  const seen: Seen = { compacts: [], notes: [], prompts: [], reflog: [entry('commit (initial): Start', 1762934400)] }
   on('turn.complete', (_, e) => ({ text: e.answer }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { tokens, window: 1_000_000 }, rateLimits: [], changed: [] } }) as never)
   on('skill.prompt', (_, e) => ({ text: e.text }))
@@ -65,6 +73,11 @@ const world = (on: On, $: Engine, tokens: number): Seen => {
   on('prompt.submit', (_, e) => {
     seen.prompts.push(e.text)
     return { text: e.text } as never
+  })
+  on('session.cwd', () => ({ value: '/repo' }) as never)
+  on('process.run', (_, e) => {
+    const stdout = e.argv[1] === 'reflog' ? `${seen.reflog.join('\n')}\n` : e.argv[1] === 'worktree' ? 'worktree /repo\nHEAD 91c4c32\nbranch refs/heads/main\n\n' : ''
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } as never
   })
   on('ui.toast', () => ({ value: undefined }) as never)
   on('ui.log', () => ({ value: undefined }) as never)
@@ -153,6 +166,10 @@ test("a subagent's JavaScript in between does not make the main call a subagent'
   await callRow($, [{ id: 'toolu_12', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: 'busy' })` } }], 'agent-1')
   await callRow($, [{ id: 'toolu_13', name: 'REPL', input: { code: 'await tools.Bash({ command: "ls" })' } }])
   expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy') } as never)).text).toBe('Only the main conversation sets the compaction mark.')
+  // As seen live: the main script starts a subagent whose prompt names the skill, and the subagent's script calls it.
+  await callRow($, [{ id: 'toolu_14', name: 'REPL', input: { code: `await tools.Agent({ prompt: 'Call ${markSkill} with busy.' })` } }])
+  await callRow($, [{ id: 'toolu_15', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: 'busy' })` } }], 'agent-2')
+  expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy') } as never)).text).toBe('Only the main conversation sets the compaction mark.')
   await endTurn($)
   expect(seen.compacts).toHaveLength(1)
 })
@@ -178,14 +195,27 @@ test("a direct commit call gets the reminder in its own result, naming the skill
   expect(seen.notes).toEqual([])
 })
 
-test("a commit the model's JavaScript made gets the reminder in a row of its own", async ($, on) => {
+test("a commit the model's JavaScript made gets the reminder in a row of its own, when HEAD's reflog shows it", async ($, on) => {
   const seen = world(on, $, 250_000)
   if (!(await isCodeModeLoaded($))) return
+  // The script runs, commits, and only then are its calls recorded, with no output.
+  await callRow($, [{ id: 'toolu_20', name: 'REPL', input: { code: 'await tools.Bash({ command: "git commit -qm fix" })' } }])
+  seen.reflog.unshift(entry('commit: Fix the parser'))
   await callRow($, [{ id: 'repl_1', name: 'Bash', input: { command: 'git add -A && git commit -qm "Fix the parser"' } }])
   const content = await resultRow($, 'repl_1', '')
   expect(content).not.toContain('this commit saved work')
   expect(seen.notes).toHaveLength(1)
   expect(seen.notes[0]).toContain('this commit saved work outside the conversation')
+})
+
+test("a script's commit command that committed nothing gets no reminder", async ($, on) => {
+  const seen = world(on, $, 250_000)
+  if (!(await isCodeModeLoaded($))) return
+  // "nothing to commit": the reflog has no entry since the script started.
+  await callRow($, [{ id: 'toolu_21', name: 'REPL', input: { code: 'await tools.Bash({ command: "git commit -qm fix" })' } }])
+  await callRow($, [{ id: 'repl_2', name: 'Bash', input: { command: 'git commit -qm "Fix the parser"' } }])
+  await resultRow($, 'repl_2', '')
+  expect(seen.notes).toEqual([])
 })
 
 test('below boundaryTokens a commit gets no reminder', async ($, on) => {
