@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { markArgsLine, markCallOf, markSkill, matchMarkCall, parseMarkArgs, scriptCommitLogged } from '../hooks/logic'
+import { markArgsLine, markCallOf, markSkill, matchMarkCall, mayChangeFolder, parseMarkArgs, scriptCommitLogged } from '../hooks/logic'
 
 // The skill's text as the engine expands it: its body, the arguments in place of `$ARGUMENTS`.
 const skillText = (args: string) =>
@@ -31,7 +31,7 @@ test('a focus line that started with `!` gets it back from the escape the engine
 })
 
 test('a call that may run the skill is recorded with whose it is, and matched by its arguments', () => {
-  expect(markCallOf({ id: 'toolu_1', name: 'Skill', input: { skill: markSkill, args: 'busy\r\nx\n' } }, undefined)).toEqual({ args: 'busy\nx' })
+  expect(markCallOf({ id: 'toolu_1', name: 'Skill', input: { skill: markSkill, args: 'busy\r\nx\n' } }, undefined)).toEqual({ args: 'busy\nx', id: 'toolu_1' })
   expect(markCallOf({ id: 'toolu_2', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args })` } }, 'agent-1')).toEqual({ agentId: 'agent-1' })
   // JavaScript that does not name the skill, another skill, and the record of a call JavaScript already made: none.
   expect(markCallOf({ id: 'toolu_3', name: 'REPL', input: { code: 'await tools.Read({ file_path: "a" })' } }, 'agent-1')).toBe(null)
@@ -67,6 +67,32 @@ test("a script's commit is judged by the reflog only where it can tell", () => {
   for (const command of ['cd ~/other && git commit -qm x', 'git -C ../other commit -qm x', 'Set-Location ..; git commit -qm x', 'GIT_DIR=/x/.git git commit -qm x'])
     expect(judge(empty, command)).toBe(null)
   expect(judge({ exitCode: 128, stdout: '' }, 'git commit -qm x')).toBe(null)
+})
+
+test('a folder change counts where a command starts or before git\'s subcommand, not in a message or an option', () => {
+  for (const command of [
+    'cd ~/other && git commit -qm x',
+    'git status; pushd ../x && git commit -qm y',
+    'git -C ../other commit -qm x',
+    'git -c user.name=a -C ../other commit -qm x',
+    'bash -c "cd ../x && git commit -qm y"',
+    'out="$(cd ../x; git commit -qm y)"',
+    'GIT_DIR=/x/.git git commit -qm x',
+    'git --git-dir=/x/.git commit -qm x',
+  ])
+    expect([command, mayChangeFolder(command)]).toEqual([command, true])
+  for (const command of [
+    'git commit -q --amend -C HEAD',
+    'git commit -qC abc123',
+    'grep -C3 TODO a.ts && git commit -qm x',
+    'ls -C && git commit -qm x',
+    'git commit -qm "Make cd work in scripts"',
+    "git commit -qm 'Set GIT_DIR= and --git-dir right'",
+    'git commit -q --message="pushd support"',
+    'git commit -qm "$(cd x; echo subject)"',
+    "git commit -qF - <<'EOF'\nFix the parser\n\ncd now works in scripts\nEOF",
+  ])
+    expect([command, mayChangeFolder(command)]).toEqual([command, false])
 })
 
 // `reflog`: HEAD's reflog, newest first, as `git reflog` prints it; a test adds to it when its command commits.
@@ -238,6 +264,43 @@ test("a script's second commit command, which committed nothing, gets no second 
   await callRow($, [{ id: 'repl_4', name: 'Bash', input: { command: 'git commit -qm two' } }])
   await resultRow($, 'repl_4', '')
   expect(seen.notes).toHaveLength(1)
+})
+
+test("two commit commands of a script in one row get one reminder", async ($, on) => {
+  const seen = world(on, $, 250_000)
+  if (!(await isCodeModeLoaded($))) return
+  await callRow($, [{ id: 'toolu_23', name: 'REPL', input: { code: 'await tools.Bash({ command: "git commit -qm one" }); await tools.Bash({ command: "git commit -qm two" })' } }])
+  seen.reflog.unshift(entry('commit: one'))
+  await callRow($, [
+    { id: 'repl_5', name: 'Bash', input: { command: 'git commit -qm one' } },
+    { id: 'repl_6', name: 'Bash', input: { command: 'git commit -qm two' } },
+  ])
+  await $.session.append({
+    door: 'tool-result',
+    origin: { kind: 'tool', tool: 'Bash' },
+    uuid: 'result-repl_5-6',
+    message: { type: 'user', content: ['repl_5', 'repl_6'].map(id => ({ type: 'tool_result', tool_use_id: id, content: '' })) },
+  } as never)
+  expect(seen.notes).toHaveLength(1)
+  expect(seen.notes[0]?.match(/this commit saved work/g)).toHaveLength(1)
+})
+
+test("a subagent's direct call that never ran the skill is dropped when its result comes", async ($, on) => {
+  const seen = world(on, $, 250_000)
+  if (!(await isCodeModeLoaded($))) return
+  // Denied: the result row comes, the skill never ran, and the subagent's turn has not ended.
+  await callRow($, [{ id: 'toolu_40', name: 'Skill', input: { skill: markSkill, args: 'busy' } }], 'agent-1')
+  await $.session.append({
+    door: 'tool-result',
+    origin: { kind: 'tool', tool: 'Skill' },
+    uuid: 'result-toolu_40',
+    agentId: 'agent-1',
+    message: { type: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_40', content: 'Permission denied', is_error: true }] },
+  } as never)
+  await callRow($, [{ id: 'toolu_41', name: 'Skill', input: { skill: markSkill, args: 'busy' } }])
+  expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy') } as never)).text).toBe('The mark is `busy`.')
+  await endTurn($)
+  expect(seen.compacts).toEqual([])
 })
 
 test("a subagent's pending call is dropped when its turn ends, so it can't be matched to a later main call", async ($, on) => {

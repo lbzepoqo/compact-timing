@@ -11,7 +11,7 @@ declare module 'claude-code' {
       // When the main conversation's newest Code Mode script started: a commit it made is checked in HEAD's reflog from then.
       scriptStartedAt: number
       // Calls that may run the mark skill, oldest first, with the subagent's id: the skill's hook has none of its own.
-      markCalls: { agentId?: string; args?: string }[]
+      markCalls: { agentId?: string; args?: string; id?: string }[]
     }
   }
 }

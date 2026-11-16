@@ -116,9 +116,16 @@ export const register: Register = (on, options) => {
         await update($, commands, previous => Object.fromEntries([...Object.entries(previous), ...commits].slice(-maxCommands))).catch(() => undefined)
       return next(e)
     }
-    if (e.door !== 'tool-result' || e.agentId !== undefined) return next(e)
+    if (e.door !== 'tool-result') return next(e)
     const results = blocks.filter(block => block.type === 'tool_result' && typeof block.tool_use_id === 'string')
     if (results.length === 0) return next(e)
+    // A direct mark call whose result came while it is still pending never ran the skill: drop it, in any agent, so it
+    // can't be matched to a later call. Read first: most results are not a mark call's.
+    const resultIds = new Set(results.map(block => String(block.tool_use_id)))
+    const pendingCalls = await read($, markCalls).catch(() => [] as MarkCall[])
+    if (pendingCalls.some(call => call.id !== undefined && resultIds.has(call.id)))
+      await update($, markCalls, previous => previous.filter(call => call.id === undefined || !resultIds.has(call.id))).catch(() => undefined)
+    if (e.agentId !== undefined) return next(e)
     const [pending, isNudged] = await Promise.all([read($, commands).catch(() => ({}) as Stored['commands']), read($, nudged).catch(() => true)])
     const calls = new Map(results.flatMap(block => {
       const call = pending[String(block.tool_use_id)]
@@ -126,10 +133,8 @@ export const register: Register = (on, options) => {
     }))
     // Most results are not a commit, and the nudge comes once: those rows need nothing more.
     if (calls.size === 0 && isNudged) return next(e)
-    if (calls.size > 0) {
-      const ids = new Set(results.map(block => String(block.tool_use_id)))
-      await update($, commands, previous => Object.fromEntries(Object.entries(previous).filter(([id]) => !ids.has(id)))).catch(() => undefined)
-    }
+    if (calls.size > 0)
+      await update($, commands, previous => Object.fromEntries(Object.entries(previous).filter(([id]) => !resultIds.has(id)))).catch(() => undefined)
     const notes = new Map<Block, string[]>()
     const add = (block: Block, text: string) => notes.set(block, [...(notes.get(block) ?? []), text])
     try {
@@ -138,6 +143,8 @@ export const register: Register = (on, options) => {
         $.session.usage().then(usage => usage.context.tokens).catch(() => undefined),
       ])
       let isResumeReminded = false
+      // The script's notes are given once: a second commit command of it in this row brings no second reminder.
+      let isScriptReminded = false
       // A call a script made is recorded with no output, so whether it committed is read from HEAD's reflog since the
       // script started, once for the row. Under a `busy` mark the words are enough, as with a direct call. Without a
       // start time, or where the reflog can't tell (`scriptCommitLogged`), the words decide, as for a silent direct call.
@@ -147,15 +154,20 @@ export const register: Register = (on, options) => {
       const endedAt = Date.now()
       for (const [block, call] of calls) {
         if (block.is_error === true || !shouldRemind(current, tokens, limits)) continue
+        const isScript = isScriptCallId(block.tool_use_id)
+        if (isScript && isScriptReminded) continue
         const logged = reflog !== null && isScriptCallId(block.tool_use_id) ? scriptCommitLogged(reflog, startedAt, endedAt, call.command) : null
         const isCommitted = logged ?? isRemindableCommit(call.tool, { command: call.command }, resultText(block.content), current)
         if (isCommitted) {
           add(block, commitReminder(markSkillName, current, skillAddResume))
           // Only the reminder for a mark that is not busy names `resume`, so only it says what the nudge says.
           isResumeReminded ||= current?.state !== 'busy'
-          // The commits up to now are reminded: the script's next commit command is judged from the next second (the
-          // reflog's), so one that commits nothing brings no second reminder.
-          if (logged === true) await update($, scriptStartedAt, () => (Math.floor(endedAt / 1000) + 1) * 1000).catch(() => undefined)
+          // The commits up to now are reminded: the script's next commit command, in a later row, is judged from the
+          // next second (the reflog's), so one that commits nothing brings no second reminder.
+          if (isScript) {
+            isScriptReminded = true
+            if (startedAt > 0) await update($, scriptStartedAt, () => (Math.floor(endedAt / 1000) + 1) * 1000).catch(() => undefined)
+          }
         }
       }
       if (tokens !== undefined && shouldNudge(current, tokens, isNudged, limits)) {
@@ -221,7 +233,8 @@ export const register: Register = (on, options) => {
     if (pendingCalls.some(call => call.agentId === e.agentId))
       await update($, markCalls, previous => previous.filter(call => call.agentId !== e.agentId)).catch(() => undefined)
     if (e.agentId !== undefined) return result
-    if ((await read($, scriptStartedAt).catch(() => 0)) !== 0) await update($, scriptStartedAt, () => 0).catch(() => undefined)
+    // A failed read falls through to the write: a start time must not reach the next turn.
+    if ((await read($, scriptStartedAt).catch(() => -1)) !== 0) await update($, scriptStartedAt, () => 0).catch(() => undefined)
     try {
       const tokens = (await $.session.usage()).context.tokens
       let current = null as Mark | null

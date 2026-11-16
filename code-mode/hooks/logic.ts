@@ -973,9 +973,11 @@ export const isScriptCallId = (id: unknown) => typeof id === 'string' && id.star
 /**
  * A call that may run the mark skill, from the model row that holds it: a direct `Skill` call with its arguments, or
  * Code Mode JavaScript that calls `tools.Skill` with the skill's name, whose arguments the plugin can't read from the
- * code. `agentId` is the subagent's, absent for the main conversation: what the skill's own hook can't tell.
+ * code. `agentId` is the subagent's, absent for the main conversation: what the skill's own hook can't tell. `id` is a
+ * direct call's tool use id: its result row comes after the skill ran, so a call still pending then never ran it (it
+ * was denied or failed) and is dropped.
  */
-export type MarkCall = { agentId?: string; args?: string }
+export type MarkCall = { agentId?: string; args?: string; id?: string }
 
 /** Kept per session, oldest first, so a call that never ran the skill can't grow the stored state without end. */
 export const maxMarkCalls = 20
@@ -986,7 +988,11 @@ export const markCallOf = (use: { [field: string]: unknown }, agentId: string | 
   const owner = agentId === undefined ? {} : { agentId }
   const input = (use.input ?? {}) as Record<string, unknown>
   if (use.name === 'Skill' && input.skill === markSkill)
-    return { ...owner, args: typeof input.args === 'string' ? input.args.replace(/\r\n?/g, '\n').trim() : '' }
+    return {
+      ...owner,
+      args: typeof input.args === 'string' ? input.args.replace(/\r\n?/g, '\n').trim() : '',
+      ...(typeof use.id === 'string' ? { id: use.id } : {}),
+    }
   // Naming the skill is not enough: a script that starts a subagent names it in the subagent's prompt.
   if (use.name === 'REPL' && typeof input.code === 'string' && input.code.includes('tools.Skill') && input.code.includes(markSkill))
     return owner
@@ -995,7 +1001,8 @@ export const markCallOf = (use: { [field: string]: unknown }, agentId: string | 
 
 /**
  * Which pending call ran the skill with these arguments: the oldest direct call with the same arguments, since direct
- * calls run in the order they were made; else the newest JavaScript call that calls the skill, since a script that
+ * calls run in the order they were made, and one that never ran the skill is dropped when its result comes; else the
+ * newest JavaScript call that calls the skill, since a script that
  * starts a subagent runs until the subagent's own script, which called the skill, is done. -1 when none fits, as when
  * the user typed the skill.
  */
@@ -1008,14 +1015,29 @@ export const matchMarkCall = (pending: readonly MarkCall[], args: string): numbe
 export type PendingCommand = { tool: string; command: string }
 
 /**
- * Whether a command may run git in a folder other than the session folder: it changes folder (`cd`, `pushd`,
- * PowerShell's `Set-Location`) or points git elsewhere (`git -C`, `--git-dir`, `GIT_DIR=`). A path it only names, as
- * `git add src/a.ts` or a link in the commit message does, doesn't count. A folder change made by an earlier command,
- * which the shell keeps, is not seen.
+ * A command with its commit messages blanked: the values of `-m`/`--message` and the bodies of heredocs, which may
+ * hold any words (`git commit -qm "Make cd work"`). Other quoted text stays: `bash -c "cd x && git commit"` changes
+ * folder.
  */
-export const mayChangeFolder = (command: string) =>
-  /(^|[\s;&|(])(cd|pushd|chdir|set-location|push-location|sl)(\s|$)|--git-dir|--work-tree|\bGIT_(DIR|WORK_TREE)=/i.test(command) ||
-  /\s-C/.test(command)
+const withoutMessages = (command: string) =>
+  command
+    .replace(/<<-?[ \t]*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n[ \t]*\2(?=\n|$)/g, '<<message')
+    .replace(/(\s(?:-[a-zA-Z]*m|--message)(?:=|\s*))(?:'[^']*'|"(?:\\.|[^"\\])*"|\S+)/g, '$1message')
+
+/**
+ * Whether a command may run git in a folder other than the session folder: it changes folder (`cd`, `pushd`,
+ * PowerShell's `Set-Location`, where a command starts) or points git elsewhere (`git -C` before the subcommand,
+ * `--git-dir`, `GIT_DIR=`). A path it only names, as `git add src/a.ts` or a link in the commit message does, doesn't
+ * count, nor do those words in a commit message or an option of the subcommand (`git commit -C HEAD`, `grep -C3`). A
+ * folder change made by an earlier command, which the shell keeps, is not seen.
+ */
+export const mayChangeFolder = (command: string) => {
+  const text = withoutMessages(command)
+  return (
+    /(^|[;&|({\n"'`])\s*(cd|pushd|chdir|set-location|push-location|sl)(\s|$)|--git-dir|--work-tree|\bGIT_(DIR|WORK_TREE)=/i.test(text) ||
+    /\bgit(\s+(-c\s+\S+|--?[\w-]+(=\S+)?))*\s+-C(\s|$)/.test(text)
+  )
+}
 
 /**
  * Whether a commit command a script ran made a commit, by the session folder's HEAD reflog since the script started:
