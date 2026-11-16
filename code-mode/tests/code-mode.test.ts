@@ -85,6 +85,9 @@ test('a folder change counts where a command starts or before git\'s subcommand,
     'if true; then cd ../x; git commit -qm y; fi',
     "bash <<'EOF'\ncd ../x\ngit commit -qm y\nEOF",
     'git.exe -C ../x commit -qm y',
+    'GIT.EXE -C ../x commit -qm y',
+    'command cd ../x && git commit -qm y',
+    'if false; then :; elif cd ../x; then git commit -qm y; fi',
   ])
     expect([command, mayChangeFolder(command)]).toEqual([command, true])
   for (const command of [
@@ -97,6 +100,10 @@ test('a folder change counts where a command starts or before git\'s subcommand,
     'git commit -q --message="pushd support"',
     'git commit -qm "$(cd x; echo subject)"',
     "git commit -qF - <<'EOF'\nFix the parser\n\ncd now works in scripts\nEOF",
+    "git commit -m \"$(cat <<'EOF'\nFix \"quoted\" parser\n\ncd now works\nGIT_DIR= is honoured\nEOF\n)\"",
+    "cat <<'EOF' | git commit -qF -\nFix\n\ncd now works\nEOF",
+    "git commit -qF /dev/stdin <<'EOF'\nFix\n\ncd now works\nEOF",
+    "cat > deploy.sh <<'EOF'\ncd /opt/app\nEOF\ngit add deploy.sh && git commit -qm 'Add deploy'",
   ])
     expect([command, mayChangeFolder(command)]).toEqual([command, false])
 })

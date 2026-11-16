@@ -1014,13 +1014,14 @@ export const matchMarkCall = (pending: readonly MarkCall[], args: string): numbe
 export type PendingCommand = { tool: string; command: string }
 
 /**
- * A command with its commit messages blanked: the values of `-m`/`--message` and the body of a heredoc read with
- * `-F`/`--file`, which may hold any words (`git commit -qm "Make cd work"`). Other quoted text and heredocs stay:
- * `bash -c "cd x && git commit"` changes folder.
+ * A command with its commit messages blanked: the values of `-m`/`--message` and the bodies of heredocs (a message for
+ * `-F`, a file's content), which may hold any words (`git commit -qm "Make cd work"`). A heredoc a shell runs
+ * (`bash <<EOF`) and other quoted text stay: `bash -c "cd x && git commit"` changes folder.
  */
 const withoutMessages = (command: string) =>
   command
-    .replace(/(\s(?:-[a-zA-Z]*F|--file)(?:=|\s*)-?\s*<<-?[ \t]*)(['"]?)(\w+)\2[^\n]*\n[\s\S]*?\n[ \t]*\3(?=\n|$)/g, '$1message')
+    .replace(/(^|[^\w.-])((?:bash|sh|zsh|dash|ksh|pwsh)(?:\s+-\S+)*\s*)?(<<-?[ \t]*)(['"]?)(\w+)\4[^\n]*\n[\s\S]*?\n[ \t]*\5(?=\n|$)/g,
+      (whole, before: string, shell: string | undefined, start: string) => (shell === undefined ? `${before}${start}message` : whole))
     .replace(/(\s(?:-[a-zA-Z]*m|--message)(?:=|\s*))(?:'[^']*'|"(?:\\.|[^"\\])*"|[^\s;&|)]+)/g, '$1message')
 
 /**
@@ -1033,8 +1034,8 @@ const withoutMessages = (command: string) =>
 export const mayChangeFolder = (command: string) => {
   const text = withoutMessages(command)
   return (
-    /(^|[;&|({\n"'`])\s*((do|then|else|time|!)\s+)*(cd|pushd|chdir|set-location|push-location|sl)(\s|$)|--git-dir|--work-tree|\bGIT_(DIR|WORK_TREE)=/i.test(text) ||
-    /\bgit(\.exe)?(\s+(-c\s+\S+|--?[\w-]+(=\S+)?))*\s+-C(\s|$)/.test(text)
+    /(^|[;&|({\n"'`])\s*((do|then|else|elif|time|command|builtin|!)\s+)*(cd|pushd|chdir|set-location|push-location|sl)(\s|$)|--git-dir|--work-tree|\bGIT_(DIR|WORK_TREE)=/i.test(text) ||
+    /\b[Gg][Ii][Tt](\.[Ee][Xx][Ee])?(\s+(-c\s+\S+|--?[\w-]+(=\S+)?))*\s+-C(\s|$)/.test(text)
   )
 }
 
