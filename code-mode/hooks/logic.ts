@@ -1002,8 +1002,7 @@ export const markCallOf = (use: { [field: string]: unknown }, agentId: string | 
 /**
  * Which pending call ran the skill with these arguments: the oldest direct call with the same arguments, since direct
  * calls run in the order they were made, and one that never ran the skill is dropped when its result comes; else the
- * newest JavaScript call that calls the skill, since a script that
- * starts a subagent runs until the subagent's own script, which called the skill, is done. -1 when none fits, as when
+ * newest JavaScript call that calls the skill, since a script that starts a subagent runs until the subagent's own script, which called the skill, is done. -1 when none fits, as when
  * the user typed the skill.
  */
 export const matchMarkCall = (pending: readonly MarkCall[], args: string): number => {
@@ -1015,14 +1014,14 @@ export const matchMarkCall = (pending: readonly MarkCall[], args: string): numbe
 export type PendingCommand = { tool: string; command: string }
 
 /**
- * A command with its commit messages blanked: the values of `-m`/`--message` and the bodies of heredocs, which may
- * hold any words (`git commit -qm "Make cd work"`). Other quoted text stays: `bash -c "cd x && git commit"` changes
- * folder.
+ * A command with its commit messages blanked: the values of `-m`/`--message` and the body of a heredoc read with
+ * `-F`/`--file`, which may hold any words (`git commit -qm "Make cd work"`). Other quoted text and heredocs stay:
+ * `bash -c "cd x && git commit"` changes folder.
  */
 const withoutMessages = (command: string) =>
   command
-    .replace(/<<-?[ \t]*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n[ \t]*\2(?=\n|$)/g, '<<message')
-    .replace(/(\s(?:-[a-zA-Z]*m|--message)(?:=|\s*))(?:'[^']*'|"(?:\\.|[^"\\])*"|\S+)/g, '$1message')
+    .replace(/(\s(?:-[a-zA-Z]*F|--file)(?:=|\s*)-?\s*<<-?[ \t]*)(['"]?)(\w+)\2[^\n]*\n[\s\S]*?\n[ \t]*\3(?=\n|$)/g, '$1message')
+    .replace(/(\s(?:-[a-zA-Z]*m|--message)(?:=|\s*))(?:'[^']*'|"(?:\\.|[^"\\])*"|[^\s;&|)]+)/g, '$1message')
 
 /**
  * Whether a command may run git in a folder other than the session folder: it changes folder (`cd`, `pushd`,
@@ -1034,8 +1033,8 @@ const withoutMessages = (command: string) =>
 export const mayChangeFolder = (command: string) => {
   const text = withoutMessages(command)
   return (
-    /(^|[;&|({\n"'`])\s*(cd|pushd|chdir|set-location|push-location|sl)(\s|$)|--git-dir|--work-tree|\bGIT_(DIR|WORK_TREE)=/i.test(text) ||
-    /\bgit(\s+(-c\s+\S+|--?[\w-]+(=\S+)?))*\s+-C(\s|$)/.test(text)
+    /(^|[;&|({\n"'`])\s*((do|then|else|time|!)\s+)*(cd|pushd|chdir|set-location|push-location|sl)(\s|$)|--git-dir|--work-tree|\bGIT_(DIR|WORK_TREE)=/i.test(text) ||
+    /\bgit(\.exe)?(\s+(-c\s+\S+|--?[\w-]+(=\S+)?))*\s+-C(\s|$)/.test(text)
   )
 }
 

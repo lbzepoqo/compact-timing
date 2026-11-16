@@ -120,9 +120,10 @@ export const register: Register = (on, options) => {
     const results = blocks.filter(block => block.type === 'tool_result' && typeof block.tool_use_id === 'string')
     if (results.length === 0) return next(e)
     // A direct mark call whose result came while it is still pending never ran the skill: drop it, in any agent, so it
-    // can't be matched to a later call. Read first: most results are not a mark call's.
+    // can't be matched to a later call. Only a direct call is kept by id, and in Code Mode most calls are a script's.
     const resultIds = new Set(results.map(block => String(block.tool_use_id)))
-    const pendingCalls = await read($, markCalls).catch(() => [] as MarkCall[])
+    const isDirectRow = results.some(block => !isScriptCallId(block.tool_use_id))
+    const pendingCalls = isDirectRow ? await read($, markCalls).catch(() => [] as MarkCall[]) : []
     if (pendingCalls.some(call => call.id !== undefined && resultIds.has(call.id)))
       await update($, markCalls, previous => previous.filter(call => call.id === undefined || !resultIds.has(call.id))).catch(() => undefined)
     if (e.agentId !== undefined) return next(e)

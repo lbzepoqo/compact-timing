@@ -79,6 +79,12 @@ test('a folder change counts where a command starts or before git\'s subcommand,
     'out="$(cd ../x; git commit -qm y)"',
     'GIT_DIR=/x/.git git commit -qm x',
     'git --git-dir=/x/.git commit -qm x',
+    'git commit -qm wip; cd ../other && git commit -qm z',
+    'git commit -qm x&&cd ../o',
+    'for d in a b; do cd $d && git commit -qm x; done',
+    'if true; then cd ../x; git commit -qm y; fi',
+    "bash <<'EOF'\ncd ../x\ngit commit -qm y\nEOF",
+    'git.exe -C ../x commit -qm y',
   ])
     expect([command, mayChangeFolder(command)]).toEqual([command, true])
   for (const command of [
