@@ -1,0 +1,32 @@
+{
+  "name": "compact-timing-code-mode",
+  "version": "0.1.0",
+  "description": "compact-timing for Code Mode: compacts the conversation at task boundaries instead of at a fixed token count. The model sets the mark with a skill instead of a tool, so Code Mode stays on. No pointer mode",
+  "author": {
+    "name": "lbzepoqo",
+    "url": "https://github.com/lbzepoqo"
+  },
+  "repository": "https://github.com/lbzepoqo/compact-timing",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "boundaryTokens": {
+      "type": "number",
+      "title": "Boundary tokens",
+      "description": "At a marked boundary, compact when the context holds at least this many tokens",
+      "default": 200000
+    },
+    "softTokens": {
+      "type": "number",
+      "title": "Soft limit tokens",
+      "description": "Without a busy mark, compact when the context holds at least this many tokens. Keep autoCompactWindow above this as the hard limit",
+      "default": 300000
+    },
+    "contextNote": {
+      "type": "boolean",
+      "title": "Context note",
+      "description": "Once the context reaches boundaryTokens, tell the model to suggest /clear or a handoff when a request starts unrelated work, and to set the boundary mark at the next break when it continues the work",
+      "default": true
+    }
+  }
+}

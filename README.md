@@ -15,7 +15,7 @@ Restart Claude Code. The `lbzepoqo/claude-plugins` marketplace also lists it, as
 
 Keep Claude Code's own `autoCompactWindow` above `softTokens` (300k by default), for example `{ "autoCompactWindow": 500000 }`. It stays the hard limit when a `busy` mark is never cleared.
 
-**Not compatible with Code Mode.** Claude Code turns Code Mode off at startup when an installed mod listens to `tool.call` (and a few other tool events). This plugin has to: its `mark` tool is added with `$.tool.register`, and only a `tool.call` hook can answer it. So you choose one or the other: with this plugin enabled, Code Mode stays off. Disabling it brings Code Mode back only if none of your other mods listen to those events. Checked against Claude Code 2.1.325.
+**Code Mode** needs the other plugin in this repo, `compact-timing-code-mode` (see [Code Mode](#code-mode)). Claude Code turns Code Mode off at startup when an installed mod listens to `tool.call` (and a few other tool events), and this plugin has to, since only a `tool.call` hook can answer its `mark` tool.
 
 ## How it works
 
@@ -145,6 +145,22 @@ The requests and files are recorded as the session runs, because the plugin can 
 
 The plugin answers the pointer compaction itself, so a compaction hook from another plugin that runs after compact-timing's does not run for it. An adaptive summary goes through those hooks as any summary does.
 
+## Code Mode
+
+```sh
+claude plugin install compact-timing-code-mode@compact-timing
+claude plugin disable compact-timing@compact-timing
+```
+
+Install one of the two plugins, not both: with `compact-timing` enabled Code Mode stays off, and both would compact. The Code Mode plugin listens to no tool event, so Code Mode stays on. What differs:
+
+- **A skill instead of a tool.** The model sets the mark with the `compact-timing-code-mode:mark` skill. Its arguments are lines: the first is `boundary`, `boundary resume` or `busy`, and the focus goes on the lines after it. The plugin answers the skill in its `skill.prompt` hook, so the model reads the plugin's answer (the mark set, and whether to end the turn now) instead of the skill's text. A subagent's call sets no mark.
+- **Reminders as text.** The commit reminder and the size nudge are added to the result of the shell call the model made itself. A call the model's JavaScript made in Code Mode is recorded only after the script ran, with no output, so its reminder comes as a separate note in the conversation.
+- **No pointer mode.** The work digest needs each call's output, which those recorded calls don't hold. Every compaction is a summary, with the same instructions as `compact-timing`'s.
+- **Settings:** `boundaryTokens`, `softTokens` and `contextNote`, as below, under `compact-timing-code-mode@compact-timing`.
+
+Tested with Claude Code 2.1.325 and Sonnet in the terminal, once with Code Mode on and once with it off. Both times the commit reminder reached the model, and after a `boundary resume` call of the skill the plugin ran `/compact` at the end of the turn and sent the focus back as a prompt, and the model did the remaining step. The test prompt told the model to call the skill, so it does not show how often the model calls it unprompted. Code Mode runs only in an interactive terminal, so SDK and headless sessions were not tested. The skill's arguments arrive as written, except that the engine turns a line that starts with `!` into `\! `; the plugin undoes that.
+
 ## Settings
 
 | Option | Default | Meaning |
@@ -182,4 +198,8 @@ echo '{"boundaryTokens": "150000"}' | claude plugin configure compact-timing@com
 ```sh
 claude plugin validate .
 claude plugin test .
+claude plugin validate code-mode
+(cd code-mode && claude plugin test .)
 ```
+
+Both plugins share the logic in `code-mode/hooks/logic.ts`: a plugin can import only files inside its own folder, and `code-mode` sits inside the root plugin's. The root run also picks up `code-mode/tests`; its tests that need the Code Mode plugin's hooks return at once there, so run them from `code-mode`.

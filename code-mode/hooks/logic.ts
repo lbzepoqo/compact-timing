@@ -1,7 +1,8 @@
 import type { ProcessRunInit, ProcessRunResult, SessionMessage, ToolUseSummary } from 'claude-code'
 
-// The logic of compact-timing's `hooks/register.ts`, apart from its hooks and stored state, so a second entry in this
-// folder can share it: a plugin cannot import a file outside its own folder, and the root plugin's folder holds this one.
+// The logic both entries share: compact-timing's `hooks/register.ts`, which answers the `mark` tool in a `tool.call` hook,
+// and the Code Mode entry in this folder, which has no tool hook. It lives here because a plugin cannot import a file
+// outside its own folder, and the root plugin's folder holds this one. Hooks and stored state are in each entry.
 
 /** Whether two types are the same, optional fields included: each entry's register.ts checks its stored shapes. */
 export type Same<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false
@@ -128,9 +129,13 @@ export const markResult = (current: Mark, tokens: number | undefined, limits: Li
 export const armedMark = (current: Mark, tokens: number | undefined, limits: Limits): Mark =>
   current.resume && (tokens === undefined || tokens < limits.boundaryTokens) ? { ...current, resume: false } : current
 
+/** How a resume mark is asked for: the tool takes fields, the Code Mode skill takes lines. */
+export const toolResumeCall = '`boundary`, `resume` true and a focus listing the remaining steps'
+export const toolAddResume = 'add `resume` true'
+
 /** Once per period inside a turn: a long turn is where the plugin falls behind, since it compacts only between turns. */
-export const sizeNudge = (tokens: number, toolName: string) =>
-  `compact-timing: the context holds ${thousands(tokens)} tokens, and the plugin can compact only between turns. At the next point where the work is saved (a commit, a plan or notes file), call ${toolName} with \`boundary\`, \`resume\` true and a focus listing the remaining steps, then end the turn.`
+export const sizeNudge = (tokens: number, toolName: string, resumeCall = toolResumeCall) =>
+  `compact-timing: the context holds ${thousands(tokens)} tokens, and the plugin can compact only between turns. At the next point where the work is saved (a commit, a plan or notes file), call ${toolName} with ${resumeCall}, then end the turn.`
 
 /**
  * Whether a tool result inside a turn gets the size nudge: from `softTokens`, once, and not when a resume is armed.
@@ -411,11 +416,11 @@ export const isRemindableCommit = (tool: string, input: Record<string, unknown>,
  * Read right after a commit's result. The tool description alone is often missed, so the reminder
  * comes at the moment a boundary is most likely.
  */
-export const commitReminder = (toolName: string, current: Mark | null) =>
+export const commitReminder = (toolName: string, current: Mark | null, addResume = toolAddResume) =>
   current?.state === 'busy'
     ? `compact-timing: the mark is \`busy\`. If the step whose details exist only in the conversation is done, call ${toolName} with \`boundary\` and a focus: the next step and open decisions.`
     : [
-        `compact-timing: this commit saved work outside the conversation. If a task or milestone is done, call ${toolName} with \`boundary\` and a focus: the next step and open decisions. If steps of the current request remain, add \`resume\` true and end the turn.`,
+        `compact-timing: this commit saved work outside the conversation. If a task or milestone is done, call ${toolName} with \`boundary\` and a focus: the next step and open decisions. If steps of the current request remain, ${addResume} and end the turn.`,
         'If the work continues and its details exist only in the conversation, call it with `busy` instead.',
       ].join(' ')
 
@@ -919,4 +924,74 @@ export const limitOption = (value: unknown, fallback: number): number => {
 export function report($: { ui: { toast: (text: string) => void; log: (text: string) => void } }, text: string) {
   $.ui.toast(text)
   $.ui.log(text)
+}
+
+/**
+ * The Code Mode entry: the skill the model calls instead of the `mark` tool, since only a `tool.call` hook can answer a
+ * tool a plugin registers, and Claude Code turns Code Mode off when a mod listens to `tool.call`.
+ */
+export const markSkill = 'compact-timing-code-mode:mark'
+export const markSkillName = `the \`${markSkill}\` skill`
+export const skillResumeCall = '`boundary resume` on the first line and the remaining steps on the lines below it'
+export const skillAddResume = 'put `resume` after `boundary` on the first line'
+
+// The line in the skill's text after which its arguments stand: the engine puts them in place of `$ARGUMENTS`.
+export const markArgsLine = 'compact-timing mark arguments:'
+
+/**
+ * The skill's arguments from its text, as the model wrote them: the lines after `markArgsLine`. The engine writes a
+ * `\` before a `!` that starts a line of the arguments and a space after it, so such a line gets its `!` back. Null
+ * when the text has no arguments line.
+ */
+export const markArgsText = (skillText: string): string | null => {
+  const at = skillText.indexOf(markArgsLine)
+  if (at === -1) return null
+  return skillText
+    .slice(at + markArgsLine.length)
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map(line => line.replace(/^\\! /, '!'))
+    .join('\n')
+    .trim()
+}
+
+/**
+ * The mark from the skill's text: the first line of the arguments holds the state and, after `boundary`, the word
+ * `resume`; the lines after it are the focus. Null when the state is neither.
+ */
+export const parseMarkArgs = (skillText: string): Mark | null => {
+  const args = markArgsText(skillText)
+  if (!args) return null
+  const [stateLine = '', ...focusLines] = args.split('\n')
+  const stateWords = stateLine.trim().toLowerCase().split(/[\s,]+/)
+  return parseMark({ state: stateWords[0], resume: stateWords.slice(1).includes('resume'), focus: focusLines.join('\n') })
+}
+
+/**
+ * A call that may run the mark skill, from the model row that holds it: a direct `Skill` call with its arguments, or
+ * Code Mode JavaScript that names the skill, whose arguments the plugin can't read from the code. `isSubagent` is what
+ * the skill's own hook can't tell, since it gets no agent id.
+ */
+export type MarkCall = { isSubagent: boolean; args?: string }
+
+/** Kept per session, oldest first, so a call that never ran the skill can't grow the stored state without end. */
+export const maxMarkCalls = 20
+
+/** The mark call a row holds, or null. A call the model's JavaScript made is recorded after it ran: not counted. */
+export const markCallOf = (use: { [field: string]: unknown }, isSubagent: boolean): MarkCall | null => {
+  if (typeof use.id === 'string' && use.id.startsWith('repl_')) return null
+  const input = (use.input ?? {}) as Record<string, unknown>
+  if (use.name === 'Skill' && input.skill === markSkill)
+    return { isSubagent, args: typeof input.args === 'string' ? input.args.replace(/\r\n?/g, '\n').trim() : '' }
+  if (use.name === 'REPL' && typeof input.code === 'string' && input.code.includes(markSkill)) return { isSubagent }
+  return null
+}
+
+/**
+ * Which pending call ran the skill with these arguments: the oldest direct call with the same arguments, else the
+ * oldest JavaScript call that names the skill. -1 when none fits, as when the user typed the skill.
+ */
+export const matchMarkCall = (pending: readonly MarkCall[], args: string): number => {
+  const direct = pending.findIndex(call => call.args === args)
+  return direct !== -1 ? direct : pending.findIndex(call => call.args === undefined)
 }
