@@ -46,20 +46,27 @@ test('a call that may run the skill is recorded with whose it is, and matched by
   // The newest script: the main one that started a subagent runs until the subagent's script is done.
   expect(matchMarkCall(pending, 'boundary\nwritten in JavaScript')).toBe(1)
   expect(matchMarkCall([{ args: 'busy' }], 'boundary')).toBe(-1)
+  expect(matchMarkCall([], 'busy')).toBe(-1)
+  // Direct calls with the same arguments run in the order they were made: the oldest is matched.
+  expect(matchMarkCall([{ agentId: 'agent-1', args: 'busy' }, { args: 'busy' }], 'busy')).toBe(0)
 })
 
 test("a script's commit is judged by the reflog only where it can tell", () => {
   const now = Date.now()
   const reflog = { exitCode: 0, stdout: `${entry('commit: Fix the parser', Math.floor(now / 1000))}\n` }
-  expect(scriptCommitLogged(reflog, now - 1000, now + 1000, 'git commit -qm "Fix the parser"')).toBe(true)
-  // Another commit of the same script, with nothing staged: the reflog's commit is not its subject.
-  expect(scriptCommitLogged(reflog, now - 1000, now + 1000, 'git commit -qm "Second change"')).toBe(false)
-  // No subject to compare (`-F`): any commit since the script started counts.
-  expect(scriptCommitLogged(reflog, now - 1000, now + 1000, 'git commit -qF msg.txt')).toBe(true)
-  // Another repository, or a folder that is not one: the words decide.
-  expect(scriptCommitLogged(reflog, now - 1000, now + 1000, 'cd ~/other && git commit -qm "Fix the parser"')).toBe(null)
-  expect(scriptCommitLogged({ exitCode: 128, stdout: '' }, now - 1000, now + 1000, 'git commit -qm x')).toBe(null)
-  expect(matchMarkCall([], 'busy')).toBe(-1)
+  const empty = { exitCode: 0, stdout: '' }
+  const judge = (run: { exitCode: number; stdout: string }, command: string) => scriptCommitLogged(run, now - 1000, now + 1000, command)
+  // Any commit since the script started counts, whatever message the command gives it.
+  expect(judge(reflog, 'git commit -qm "Fix the parser"')).toBe(true)
+  expect(judge(reflog, 'git commit -qm "$MSG"')).toBe(true)
+  expect(judge(reflog, 'git commit -qF -')).toBe(true)
+  // Nothing logged: no commit, even where the command names paths or a link without changing folder.
+  expect(judge(empty, 'git commit -qm "Fix"')).toBe(false)
+  expect(judge(empty, 'git add code-mode/hooks/logic.ts && git commit -qm "Fix and/or parse ~ https://example.com/x"')).toBe(false)
+  // A command that may commit in another folder, or a folder that is not a repository: the words decide.
+  for (const command of ['cd ~/other && git commit -qm x', 'git -C ../other commit -qm x', 'Set-Location ..; git commit -qm x', 'GIT_DIR=/x/.git git commit -qm x'])
+    expect(judge(empty, command)).toBe(null)
+  expect(judge({ exitCode: 128, stdout: '' }, 'git commit -qm x')).toBe(null)
 })
 
 // `reflog`: HEAD's reflog, newest first, as `git reflog` prints it; a test adds to it when its command commits.
@@ -219,6 +226,29 @@ test("a commit the model's JavaScript made gets the reminder in a row of its own
   expect(content).not.toContain('this commit saved work')
   expect(seen.notes).toHaveLength(1)
   expect(seen.notes[0]).toContain('this commit saved work outside the conversation')
+})
+
+test("a script's second commit command, which committed nothing, gets no second reminder", async ($, on) => {
+  const seen = world(on, $, 250_000)
+  if (!(await isCodeModeLoaded($))) return
+  await callRow($, [{ id: 'toolu_22', name: 'REPL', input: { code: 'await tools.Bash({ command: "git commit -qm one" }); await tools.Bash({ command: "git commit -qm two" })' } }])
+  seen.reflog.unshift(entry('commit: one', Math.floor(Date.now() / 1000)))
+  await callRow($, [{ id: 'repl_3', name: 'Bash', input: { command: 'git add code-mode/a.ts && git commit -qm one' } }])
+  await resultRow($, 'repl_3', '')
+  await callRow($, [{ id: 'repl_4', name: 'Bash', input: { command: 'git commit -qm two' } }])
+  await resultRow($, 'repl_4', '')
+  expect(seen.notes).toHaveLength(1)
+})
+
+test("a subagent's pending call is dropped when its turn ends, so it can't be matched to a later main call", async ($, on) => {
+  const seen = world(on, $, 250_000)
+  if (!(await isCodeModeLoaded($))) return
+  await callRow($, [{ id: 'toolu_30', name: 'Skill', input: { skill: markSkill, args: 'busy' } }], 'agent-1')
+  await $.turn.complete({ reason: 'answer', answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't2', agentId: 'agent-1' } as never)
+  await callRow($, [{ id: 'toolu_31', name: 'Skill', input: { skill: markSkill, args: 'busy' } }])
+  expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy') } as never)).text).toBe('The mark is `busy`.')
+  await endTurn($)
+  expect(seen.compacts).toEqual([])
 })
 
 test("a script's commit command that committed nothing gets no reminder", async ($, on) => {

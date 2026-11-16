@@ -153,6 +153,9 @@ export const register: Register = (on, options) => {
           add(block, commitReminder(markSkillName, current, skillAddResume))
           // Only the reminder for a mark that is not busy names `resume`, so only it says what the nudge says.
           isResumeReminded ||= current?.state !== 'busy'
+          // The commits up to now are reminded: the script's next commit command is judged from the next second (the
+          // reflog's), so one that commits nothing brings no second reminder.
+          if (logged === true) await update($, scriptStartedAt, () => (Math.floor(endedAt / 1000) + 1) * 1000).catch(() => undefined)
         }
       }
       if (tokens !== undefined && shouldNudge(current, tokens, isNudged, limits)) {
@@ -212,10 +215,13 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    // A call of this agent that never ran the skill must not be matched to a later one.
-    await update($, markCalls, previous => previous.filter(call => call.agentId !== e.agentId)).catch(() => undefined)
+    // A call of this agent that never ran the skill must not be matched to a later one. Read first: most turns leave
+    // nothing to clear, and a write each turn is wasted.
+    const pendingCalls = await read($, markCalls).catch(() => [] as MarkCall[])
+    if (pendingCalls.some(call => call.agentId === e.agentId))
+      await update($, markCalls, previous => previous.filter(call => call.agentId !== e.agentId)).catch(() => undefined)
     if (e.agentId !== undefined) return result
-    await update($, scriptStartedAt, () => 0).catch(() => undefined)
+    if ((await read($, scriptStartedAt).catch(() => 0)) !== 0) await update($, scriptStartedAt, () => 0).catch(() => undefined)
     try {
       const tokens = (await $.session.usage()).context.tokens
       let current = null as Mark | null

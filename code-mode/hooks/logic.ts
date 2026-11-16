@@ -994,29 +994,34 @@ export const markCallOf = (use: { [field: string]: unknown }, agentId: string | 
 }
 
 /**
- * Which pending call ran the skill with these arguments: the newest direct call with the same arguments, else the
- * newest JavaScript call that calls the skill. Newest, since a script that starts a subagent runs until the subagent's
- * own script, which called the skill, is done. -1 when none fits, as when the user typed the skill.
+ * Which pending call ran the skill with these arguments: the oldest direct call with the same arguments, since direct
+ * calls run in the order they were made; else the newest JavaScript call that calls the skill, since a script that
+ * starts a subagent runs until the subagent's own script, which called the skill, is done. -1 when none fits, as when
+ * the user typed the skill.
  */
 export const matchMarkCall = (pending: readonly MarkCall[], args: string): number => {
-  let script = -1
-  for (let index = pending.length - 1; index >= 0; index--) {
-    if (pending[index]?.args === args) return index
-    if (script === -1 && pending[index]?.args === undefined) script = index
-  }
-  return script
+  const direct = pending.findIndex(call => call.args === args)
+  return direct !== -1 ? direct : pending.findLastIndex(call => call.args === undefined)
 }
 
 /** A shell command of the main conversation whose result has not come yet, kept by call id. */
 export type PendingCommand = { tool: string; command: string }
 
-/** Whether a command may commit somewhere other than the session folder's repository. */
-export const mayChangeFolder = (command: string) => mayNamePath(command) || /(^|[\s;&|(])(cd|pushd)\s|\s-C\s/.test(command)
+/**
+ * Whether a command may run git in a folder other than the session folder: it changes folder (`cd`, `pushd`,
+ * PowerShell's `Set-Location`) or points git elsewhere (`git -C`, `--git-dir`, `GIT_DIR=`). A path it only names, as
+ * `git add src/a.ts` or a link in the commit message does, doesn't count. A folder change made by an earlier command,
+ * which the shell keeps, is not seen.
+ */
+export const mayChangeFolder = (command: string) =>
+  /(^|[\s;&|(])(cd|pushd|chdir|set-location|push-location|sl)(\s|$)|--git-dir|--work-tree|\bGIT_(DIR|WORK_TREE)=/i.test(command) ||
+  /\s-C/.test(command)
 
 /**
  * Whether a commit command a script ran made a commit, by the session folder's HEAD reflog since the script started:
- * the commit's subject must be one the command gives, when it gives one, so a script's other commit doesn't count.
- * Null when the reflog can't tell: the folder is not a repository, or the command may commit in another one.
+ * any commit counts, so a script's second commit command that commits nothing is judged by its first. The script's
+ * notes are given once, so that brings no second reminder. Null when the reflog can't tell: the folder is not a
+ * repository, or the command may commit in another folder and the session folder's reflog shows nothing.
  */
 export const scriptCommitLogged = (
   run: { exitCode: number; stdout: string } | { error: string },
@@ -1024,6 +1029,7 @@ export const scriptCommitLogged = (
   endedAt: number,
   command: string,
 ): boolean | null => {
-  if (!isGitAnswer(run) || mayChangeFolder(command)) return null
-  return isCommitLogged(run, startedAt, endedAt, commitSubjects(command).length > 0 ? command : undefined)
+  if (!isGitAnswer(run)) return null
+  if (isCommitLogged(run, startedAt, endedAt)) return true
+  return mayChangeFolder(command) ? null : false
 }
