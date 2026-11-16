@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { markArgsLine, markCallOf, markSkill, matchMarkCall, mayChangeFolder, parseMarkArgs, scriptCommitLogged } from '../hooks/logic'
+import { markArgsLine, markCallOf, markSkill, matchMarkCall, mayChangeFolder, parseMarkArgs, scriptCommitLogged, scriptMarkArgs } from '../hooks/logic'
 
 // The skill's text as the engine expands it: its body, the arguments in place of `$ARGUMENTS`.
 const skillText = (args: string) =>
@@ -32,7 +32,11 @@ test('a focus line that started with `!` gets it back from the escape the engine
 
 test('a call that may run the skill is recorded with whose it is, and matched by its arguments', () => {
   expect(markCallOf({ id: 'toolu_1', name: 'Skill', input: { skill: markSkill, args: 'busy\r\nx\n' } }, undefined)).toEqual({ args: 'busy\nx', id: 'toolu_1' })
-  expect(markCallOf({ id: 'toolu_2', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args })` } }, 'agent-1')).toEqual({ agentId: 'agent-1' })
+  expect(markCallOf({ id: 'toolu_2', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args })` } }, 'agent-1')).toEqual({ agentId: 'agent-1', isScript: true })
+  expect(markCallOf({ id: 'toolu_7', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: 'busy\\nNext: x' })` } }, undefined)).toEqual({
+    args: 'busy\nNext: x',
+    isScript: true,
+  })
   // JavaScript that does not name the skill, another skill, and the record of a call JavaScript already made: none.
   expect(markCallOf({ id: 'toolu_3', name: 'REPL', input: { code: 'await tools.Read({ file_path: "a" })' } }, 'agent-1')).toBe(null)
   expect(markCallOf({ id: 'toolu_4', name: 'Skill', input: { skill: 'other:mark', args: 'busy' } }, undefined)).toBe(null)
@@ -49,6 +53,54 @@ test('a call that may run the skill is recorded with whose it is, and matched by
   expect(matchMarkCall([], 'busy')).toBe(-1)
   // Direct calls with the same arguments run in the order they were made: the oldest is matched.
   expect(matchMarkCall([{ agentId: 'agent-1', args: 'busy' }, { args: 'busy' }], 'busy')).toBe(0)
+  // An older script whose arguments match, when the newer ones' arguments were read and differ; else the newest script,
+  // also when none match, as for arguments read wrong.
+  const scripts = [{ args: 'boundary\nmain', isScript: true as const }, { agentId: 'agent-1', args: 'busy', isScript: true as const }]
+  expect(matchMarkCall(scripts, 'boundary\nmain')).toBe(0)
+  expect(matchMarkCall(scripts, 'busy\nread differently')).toBe(1)
+  // A newer script whose arguments can't be read may be the one that ran: it stays the match.
+  expect(matchMarkCall([{ args: 'busy', isScript: true }, { agentId: 'agent-1', isScript: true }], 'busy')).toBe(1)
+  expect(matchMarkCall([{ args: 'busy', isScript: true }, { agentId: 'agent-1' }], 'busy')).toBe(1)
+  // Past a newer script whose code gives other arguments, to one whose arguments can't be read.
+  expect(matchMarkCall([{ agentId: 'agent-1', isScript: true }, { args: 'boundary', isScript: true }], 'busy')).toBe(0)
+  // With the same arguments, the newest script, as for scripts whose arguments can't be read.
+  expect(matchMarkCall([{ args: 'busy', isScript: true }, { agentId: 'agent-1', args: 'busy', isScript: true }], 'busy')).toBe(1)
+  // A direct call comes before a script's with the same arguments.
+  expect(matchMarkCall([{ args: 'busy', isScript: true }, { args: 'busy' }], 'busy')).toBe(1)
+})
+
+test("a script's arguments for the skill are read only from a plain string in its one Skill call", () => {
+  const call = (args: string, skill = `'${markSkill}'`) => `const result = await tools.Skill({ skill: ${skill}, args: ${args} }); result`
+  expect(scriptMarkArgs(call(`'boundary\\nNext: deploy.'`))).toBe('boundary\nNext: deploy.')
+  expect(scriptMarkArgs(call(`"busy\\n\\"quoted\\" focus"`))).toBe('busy\n"quoted" focus')
+  expect(scriptMarkArgs(call('`boundary resume\nNext: it\'s step 3.\n`'))).toBe("boundary resume\nNext: it's step 3.")
+  expect(scriptMarkArgs(`await tools.Skill({skill:"${markSkill}",args:'busy',})`)).toBe('busy')
+  expect(scriptMarkArgs(`const s = await tools.Skill({skill: "${markSkill}", args: "busy\\nMain call."}); s`)).toBe('busy\nMain call.')
+  expect(scriptMarkArgs(`\nlet s = tools.Skill({ skill: '${markSkill}', args: 'busy' })\n\ns;\n`)).toBe('busy')
+  // Long runs of spaces after the call, which doesn't match, are judged at once.
+  const startedAt = Date.now()
+  expect(scriptMarkArgs(`${call(`'busy'`)}${'\n'.repeat(5000)}console.log(result)`)).toBe(undefined)
+  expect(scriptMarkArgs(`${call(`'busy'`)};${' '.repeat(5000)};x`)).toBe(undefined)
+  expect(Date.now() - startedAt).toBeLessThan(500)
+  // Compared as the skill's text is: a line's `\\! ` gives `!`, as the engine's escape does.
+  expect(scriptMarkArgs(call(`'busy\\n\\\\! x'`))).toBe('busy\n!x')
+  // A variable, a template with `${}`, an escape it doesn't read, another skill, other keys or a second call: none.
+  for (const code of [
+    call('args'),
+    call('`busy\n${focus}`'),
+    call(`'busy\\u0041'`),
+    call(`'busy'`, `'other:mark'`),
+    `await tools.Skill({ args: 'busy', skill: '${markSkill}' })`,
+    `await tools.Skill({ skill: '${markSkill}', args: 'busy', model: 'x' })`,
+    `${call(`'busy'`)}; ${call(`'boundary'`)}`,
+    `const s = await tools.Skill({ skill: '${markSkill}', args: 'busy' }); other`,
+    // Other code, where the call may be only text: a subagent's prompt, a file's content, a comment.
+    `await tools.Agent({ prompt: "Then run tools.Skill({ skill: '${markSkill}', args: 'busy' })" })`,
+    `const { Agent } = tools; await Agent({ prompt: "Run tools.Skill({ skill: '${markSkill}', args: 'busy' })" })`,
+    `await tools.Write({ file_path: 'a.md', content: "Call tools.Skill({ skill: '${markSkill}', args: 'busy' })" })`,
+    `/* tools.Skill({ skill: '${markSkill}', args: 'boundary' }) */ await tools['Skill']({ skill: '${markSkill}', args: 'busy' })`,
+  ])
+    expect([code, scriptMarkArgs(code)]).toEqual([code, undefined])
 })
 
 test("a script's commit is judged by the reflog only where it can tell", () => {
@@ -249,6 +301,29 @@ test("a subagent's JavaScript in between does not make the main call a subagent'
   expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy') } as never)).text).toBe('Only the main conversation sets the compaction mark.')
   await endTurn($)
   expect(seen.compacts).toHaveLength(1)
+})
+
+test("two agents' waiting scripts are matched by the arguments their code gives", async ($, on) => {
+  const seen = world(on, $, 250_000)
+  if (!(await isCodeModeLoaded($))) return
+  // The main script calls the skill, and a subagent's script, made later, waits too: the newest is the subagent's.
+  await callRow($, [{ id: 'toolu_16', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: 'boundary\\nNext: deploy.' })` } }])
+  await callRow($, [{ id: 'toolu_17', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: 'busy\\nSub.' })` } }], 'agent-3')
+  expect((await $.skill.prompt({ skill: markSkill, text: skillText('boundary\nNext: deploy.') } as never)).text).toBe('The mark is `boundary`.')
+  expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy\nSub.') } as never)).text).toBe('Only the main conversation sets the compaction mark.')
+  await endTurn($)
+  expect(seen.compacts).toHaveLength(1)
+})
+
+test("a subagent's script whose arguments can't be read is still refused, though an older main script's match", async ($, on) => {
+  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 250_000, window: 1_000_000 }, rateLimits: [], changed: [] } }) as never)
+  on('skill.prompt', (_, e) => ({ text: e.text }))
+  if (!(await isCodeModeLoaded($))) return
+  await callRow($, [{ id: 'toolu_18', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: 'busy' })` } }])
+  await callRow($, [{ id: 'toolu_19', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: text })` } }], 'agent-4')
+  expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy') } as never)).text).toBe('Only the main conversation sets the compaction mark.')
+  // The main script's call is still waiting, and its own run sets the mark.
+  expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy') } as never)).text).toBe('The mark is `busy`.')
 })
 
 test('arguments without a state set no mark', async ($, on) => {

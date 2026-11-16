@@ -12,7 +12,7 @@ declare module 'claude-code' {
       // commit they made is checked in HEAD's reflog from then, and whether they got their one reminder.
       script: { startedAt: number; reminded: boolean }
       // Calls that may run the mark skill, oldest first, with the subagent's id: the skill's hook has none of its own.
-      markCalls: { agentId?: string; args?: string; id?: string }[]
+      markCalls: { agentId?: string; args?: string; id?: string; isScript?: true }[]
     }
   }
 }

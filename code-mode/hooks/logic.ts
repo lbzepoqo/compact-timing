@@ -945,15 +945,17 @@ export const markArgsLine = 'compact-timing mark arguments:'
  */
 export const markArgsText = (skillText: string): string | null => {
   const at = skillText.indexOf(markArgsLine)
-  if (at === -1) return null
-  return skillText
-    .slice(at + markArgsLine.length)
+  return at === -1 ? null : normalArgs(skillText.slice(at + markArgsLine.length))
+}
+
+/** Arguments as they are compared: one kind of line break, a line's `\! ` back to `!`, no space around them. */
+const normalArgs = (text: string) =>
+  text
     .replace(/\r\n?/g, '\n')
     .split('\n')
     .map(line => line.replace(/^\\! /, '!'))
     .join('\n')
     .trim()
-}
 
 /**
  * The mark from the skill's text: the first line of the arguments holds the state and, after `boundary`, the word
@@ -972,12 +974,35 @@ export const isScriptCallId = (id: unknown) => typeof id === 'string' && id.star
 
 /**
  * A call that may run the mark skill, from the model row that holds it: a direct `Skill` call with its arguments, or
- * Code Mode JavaScript that calls `tools.Skill` with the skill's name, whose arguments the plugin can't read from the
- * code. `agentId` is the subagent's, absent for the main conversation: what the skill's own hook can't tell. `id` is a
- * direct call's tool use id: its result row comes after the skill ran, so a call still pending then never ran it (it
- * was denied or failed) and is dropped.
+ * Code Mode JavaScript that calls `tools.Skill` with the skill's name (`isScript`), with its arguments where the code
+ * gives them as a plain string (`scriptMarkArgs`). `agentId` is the subagent's, absent for the main conversation: what
+ * the skill's own hook can't tell. `id` is a direct call's tool use id: its result row comes after the skill ran, so a
+ * call still pending then never ran it (it was denied or failed) and is dropped.
  */
-export type MarkCall = { agentId?: string; args?: string; id?: string }
+export type MarkCall = { agentId?: string; args?: string; id?: string; isScript?: true }
+
+/** A script call: marked, or stored before scripts were marked, when only a direct call had arguments. */
+const isScriptMarkCall = (call: MarkCall) => call.isScript === true || call.args === undefined
+
+const stringEscapes: Record<string, string> = { n: '\n', t: '\t', r: '\r', '\\': '\\', "'": "'", '"': '"', '`': '`' }
+
+/**
+ * The arguments of a script that is only the call `await tools.Skill({ skill: '<mark skill>', args: '...' })`, as the
+ * model writes it to set the mark (also as `const result = ...; result`), when they are a plain string: quoted, or a
+ * template without `${}`, with only the common escapes. Undefined otherwise, as for a variable, other keys or any other
+ * code, where the call may be text (a file's content, a subagent's prompt): then only the order of calls can match it.
+ */
+export const scriptMarkArgs = (code: string): string | undefined => {
+  // Trimmed, and each run of spaces between tokens matched one way, so a long one can't take long.
+  const call =
+    /^(?:(?:const|let|var)\s+(\w+)\s*=\s*)?(?:await\s+)?tools\.Skill\(\s*\{\s*skill\s*:\s*(['"`])([^'"`\\]*)\2\s*,\s*args\s*:\s*(['"`])((?:\\[\s\S]|(?!\4)[^\\])*)\4\s*,?\s*\}\s*\)(?:\s*;)?(?:\s*(\w+))?(?:\s*;)?$/.exec(code.trim())
+  if (!call || call[3] !== markSkill || (call[6] !== undefined && call[6] !== call[1])) return undefined
+  const [, , , , quote, body = ''] = call
+  if (quote === '`' && body.includes('${')) return undefined
+  if (quote !== '`' && /[\r\n]/.test(body)) return undefined
+  if ((body.match(/\\[\s\S]/g) ?? []).some(escape => stringEscapes[escape.slice(1)] === undefined)) return undefined
+  return normalArgs(body.replace(/\\([\s\S])/g, (_, escaped: string) => stringEscapes[escaped] as string))
+}
 
 /** Kept per session, oldest first, so a call that never ran the skill can't grow the stored state without end. */
 export const maxMarkCalls = 20
@@ -990,24 +1015,30 @@ export const markCallOf = (use: { [field: string]: unknown }, agentId: string | 
   if (use.name === 'Skill' && input.skill === markSkill)
     return {
       ...owner,
-      args: typeof input.args === 'string' ? input.args.replace(/\r\n?/g, '\n').trim() : '',
+      args: typeof input.args === 'string' ? normalArgs(input.args) : '',
       ...(typeof use.id === 'string' ? { id: use.id } : {}),
     }
   // Naming the skill is not enough: a script that starts a subagent names it in the subagent's prompt.
-  if (use.name === 'REPL' && typeof input.code === 'string' && input.code.includes('tools.Skill') && input.code.includes(markSkill))
-    return owner
+  if (use.name === 'REPL' && typeof input.code === 'string' && input.code.includes('tools.Skill') && input.code.includes(markSkill)) {
+    const args = scriptMarkArgs(input.code)
+    return { ...owner, ...(args === undefined ? {} : { args }), isScript: true }
+  }
   return null
 }
 
 /**
  * Which pending call ran the skill with these arguments: the oldest direct call with the same arguments, since direct
- * calls run in the order they were made, and one that never ran the skill is dropped when its result comes; else the
- * newest JavaScript call that calls the skill, since a script that starts a subagent runs until the subagent's own script, which called the skill, is done. -1 when none fits, as when
- * the user typed the skill.
+ * calls run in the order they were made, and one that never ran the skill is dropped when its result comes. Else the
+ * newest script call that may have run it, since a script that starts a subagent runs until the subagent's own script,
+ * which called the skill, is done: one whose arguments are these or can't be read, past newer ones whose code gives
+ * other arguments. The newest script call when every one gives other arguments. -1 when none fits, as when the user
+ * typed the skill.
  */
 export const matchMarkCall = (pending: readonly MarkCall[], args: string): number => {
-  const direct = pending.findIndex(call => call.args === args)
-  return direct !== -1 ? direct : pending.findLastIndex(call => call.args === undefined)
+  const direct = pending.findIndex(call => !isScriptMarkCall(call) && call.args === args)
+  if (direct !== -1) return direct
+  const possible = pending.findLastIndex(call => isScriptMarkCall(call) && (call.args === args || call.args === undefined))
+  return possible !== -1 ? possible : pending.findLastIndex(isScriptMarkCall)
 }
 
 /** A shell command of the main conversation whose result has not come yet, kept by call id. */
