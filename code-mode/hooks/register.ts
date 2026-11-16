@@ -52,7 +52,14 @@ const resumes = atom({ plugin: 'compact-timing-code-mode', key: 'resumes' } as c
 const ownCompact = atom({ plugin: 'compact-timing-code-mode', key: 'ownCompact' } as const, null as OwnCompact)
 const commands = atom({ plugin: 'compact-timing-code-mode', key: 'commands' } as const, {} as Record<string, PendingCommand>)
 const markCalls = atom({ plugin: 'compact-timing-code-mode', key: 'markCalls' } as const, [] as MarkCall[])
-const scriptStartedAt = atom({ plugin: 'compact-timing-code-mode', key: 'scriptStartedAt' } as const, 0)
+/**
+ * The main conversation's newest step that ran scripts that may commit: when it started (0 for none), and whether its
+ * scripts' commits got their reminder. The scripts of one step get one, which already asks for the mark: a later
+ * commit command of them, which may have committed nothing, brings no second one.
+ */
+type ScriptRun = { startedAt: number; reminded: boolean }
+const idleScript: ScriptRun = { startedAt: 0, reminded: false }
+const script = atom({ plugin: 'compact-timing-code-mode', key: 'script' } as const, idleScript)
 
 // The atoms check that the logic's shapes fit the stored ones; these check the other way, so neither can drift.
 type Stored = PluginState['compact-timing-code-mode']
@@ -62,7 +69,8 @@ export type StoredShapesMatch = Holds<
     Same<Stored['ownCompact'], OwnCompact>,
     Same<Stored['markCalls'][number], MarkCall>,
     Same<Stored['commands'][string], PendingCommand>,
-  ] extends [true, true, true, true]
+    Same<Stored['script'], ScriptRun>,
+  ] extends [true, true, true, true, true]
     ? true
     : false
 >
@@ -103,7 +111,8 @@ export const register: Register = (on, options) => {
       if (calls.length > 0) await update($, markCalls, previous => [...previous, ...calls].slice(-maxMarkCalls)).catch(() => undefined)
       // Only a script that may commit needs its start time; most Code Mode steps are scripts.
       const isCommitScript = (use: Block) => use.name === 'REPL' && !isScriptCallId(use.id) && String((use.input as { code?: unknown })?.code ?? '').includes('commit')
-      if (!isSubagent && uses.some(isCommitScript)) await update($, scriptStartedAt, () => Date.now()).catch(() => undefined)
+      if (!isSubagent && uses.some(isCommitScript))
+        await update($, script, () => ({ startedAt: Date.now(), reminded: false })).catch(() => undefined)
       const commits = isSubagent
         ? []
         : uses.flatMap(use => {
@@ -144,32 +153,36 @@ export const register: Register = (on, options) => {
         $.session.usage().then(usage => usage.context.tokens).catch(() => undefined),
       ])
       let isResumeReminded = false
-      // The script's notes are given once: a second commit command of it in this row brings no second reminder.
-      let isScriptReminded = false
-      // A call a script made is recorded with no output, so whether it committed is read from HEAD's reflog since the
-      // script started, once for the row. Under a `busy` mark the words are enough, as with a direct call. Without a
-      // start time, or where the reflog can't tell (`scriptCommitLogged`), the words decide, as for a silent direct call.
+      // The scripts' reminder is given once (`ScriptRun`); also within this row, as the store may fail.
       const isScriptRow = [...calls.keys()].some(block => isScriptCallId(block.tool_use_id))
-      const startedAt = isScriptRow && current?.state !== 'busy' && shouldRemind(current, tokens, limits) ? await read($, scriptStartedAt).catch(() => 0) : 0
+      const run = isScriptRow && shouldRemind(current, tokens, limits) ? await read($, script).catch(() => idleScript) : idleScript
+      let isScriptReminded = run.reminded
+      // A call a script made is recorded with no output, so whether it committed is read from HEAD's reflog since the
+      // step started, once for the row. Under a `busy` mark the words are enough, as with a direct call. Without a
+      // start time, or where the reflog can't tell (`scriptCommitLogged`), the words decide, as for a silent direct call.
+      const startedAt = isScriptRow && !isScriptReminded && current?.state !== 'busy' ? run.startedAt : 0
       const reflog = startedAt > 0 ? await runGit($, reflogArguments, { timeoutMs: reflogTimeout }) : null
       const endedAt = Date.now()
       for (const [block, call] of calls) {
         if (block.is_error === true || !shouldRemind(current, tokens, limits)) continue
         const isScript = isScriptCallId(block.tool_use_id)
         if (isScript && isScriptReminded) continue
-        const logged = reflog !== null && isScriptCallId(block.tool_use_id) ? scriptCommitLogged(reflog, startedAt, endedAt, call.command) : null
+        const logged = reflog !== null && isScript ? scriptCommitLogged(reflog, startedAt, endedAt, call.command) : null
         const isCommitted = logged ?? isRemindableCommit(call.tool, { command: call.command }, resultText(block.content), current)
-        if (isCommitted) {
-          add(block, commitReminder(markSkillName, current, skillAddResume))
-          // Only the reminder for a mark that is not busy names `resume`, so only it says what the nudge says.
-          isResumeReminded ||= current?.state !== 'busy'
-          // The commits up to now are reminded: the script's next commit command, in a later row, is judged from the
-          // next second (the reflog's), so one that commits nothing brings no second reminder.
-          if (isScript) {
-            isScriptReminded = true
-            if (startedAt > 0) await update($, scriptStartedAt, () => (Math.floor(endedAt / 1000) + 1) * 1000).catch(() => undefined)
-          }
+        if (!isCommitted) continue
+        if (isScript) {
+          isScriptReminded = true
+          // Decided inside the write: another row of the step's scripts may be judged at the same time.
+          let isFirst = true
+          const isStored = await update($, script, previous => {
+            isFirst = !previous.reminded
+            return { ...previous, reminded: true }
+          }).then(() => true, () => false)
+          if (isStored && !isFirst) continue
         }
+        add(block, commitReminder(markSkillName, current, skillAddResume))
+        // Only the reminder for a mark that is not busy names `resume`, so only it says what the nudge says.
+        isResumeReminded ||= current?.state !== 'busy'
       }
       if (tokens !== undefined && shouldNudge(current, tokens, isNudged, limits)) {
         // Decided inside the write: rows of parallel calls arrive at the same time, and only one may send the nudge.
@@ -235,7 +248,8 @@ export const register: Register = (on, options) => {
       await update($, markCalls, previous => previous.filter(call => call.agentId !== e.agentId)).catch(() => undefined)
     if (e.agentId !== undefined) return result
     // A failed read falls through to the write: a start time must not reach the next turn.
-    if ((await read($, scriptStartedAt).catch(() => -1)) !== 0) await update($, scriptStartedAt, () => 0).catch(() => undefined)
+    const run = await read($, script).catch(() => null)
+    if (run === null || run.startedAt !== 0 || run.reminded) await update($, script, () => idleScript).catch(() => undefined)
     try {
       const tokens = (await $.session.usage()).context.tokens
       let current = null as Mark | null

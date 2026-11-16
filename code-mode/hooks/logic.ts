@@ -1024,18 +1024,30 @@ const withoutMessages = (command: string) =>
       (whole, before: string, shell: string | undefined, start: string) => (shell === undefined ? `${before}${start}message` : whole))
     .replace(/(\s(?:-[a-zA-Z]*m|--message)(?:=|\s*))(?:'[^']*'|"(?:\\.|[^"\\])*"|[^\s;&|)]+)/g, '$1message')
 
+/** One shell word: quoted and unquoted pieces, and escaped characters (`user.name="A B"`, `A\\ B`). */
+const shellWord = String.raw`(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s'"\\])+`
+
+// git's own options that take their value as the next word (`git help git`).
+const separateValueOption = '(-c|--namespace|--config-env|--attr-source|--super-prefix)'
+
+// `git -C` after git's own options, each matched one way only, so a long run of them can't take long.
+const gitElsewhere = new RegExp(
+  `\\b[Gg][Ii][Tt](\\.[Ee][Xx][Ee])?(\\s+(${separateValueOption}\\s+${shellWord}|(?!${separateValueOption}\\s)--?\\w[\\w-]*(=${shellWord})?))*\\s+-C(\\s|$)`,
+)
+
 /**
  * Whether a command may run git in a folder other than the session folder: it changes folder (`cd`, `pushd`,
- * PowerShell's `Set-Location`, where a command starts) or points git elsewhere (`git -C` before the subcommand,
- * `--git-dir`, `GIT_DIR=`). A path it only names, as `git add src/a.ts` or a link in the commit message does, doesn't
- * count, nor do those words in a commit message or an option of the subcommand (`git commit -C HEAD`, `grep -C3`). A
- * folder change made by an earlier command, which the shell keeps, is not seen.
+ * PowerShell's `Set-Location`, where a command starts) or points git elsewhere (`git -C` before the subcommand, also
+ * after git's own options as in `git --namespace x -C ../y`, `--git-dir`, `GIT_DIR=`). A path it only names, as
+ * `git add src/a.ts` or a link in the commit message does, doesn't count, nor do those words in a commit message or an
+ * option of the subcommand (`git commit -C HEAD`, `grep -C3`). A folder change made by an earlier command, which the
+ * shell keeps, is not seen.
  */
 export const mayChangeFolder = (command: string) => {
   const text = withoutMessages(command)
   return (
     /(^|[;&|({\n"'`])\s*((do|then|else|elif|time|command|builtin|!)\s+)*(cd|pushd|chdir|set-location|push-location|sl)(\s|$)|--git-dir|--work-tree|\bGIT_(DIR|WORK_TREE)=/i.test(text) ||
-    /\b[Gg][Ii][Tt](\.[Ee][Xx][Ee])?(\s+(-c\s+\S+|--?[\w-]+(=\S+)?))*\s+-C(\s|$)/.test(text)
+    gitElsewhere.test(text)
   )
 }
 

@@ -75,6 +75,15 @@ test('a folder change counts where a command starts or before git\'s subcommand,
     'git status; pushd ../x && git commit -qm y',
     'git -C ../other commit -qm x',
     'git -c user.name=a -C ../other commit -qm x',
+    'git --namespace foo -C ../other commit -qm x',
+    'git --config-env user.name=NAME --no-pager -C ../other commit -qm x',
+    'git --attr-source HEAD -C ../other commit -qm x',
+    'git --super-prefix sub/ -C ../other commit -qm x',
+    'git -c "user.name=A B" -C ../other commit -qm x',
+    'git -c user.name="A B" -C ../other commit -qm x',
+    "git -c user.name='A B' --namespace=\"a b\" -C ../other commit -qm x",
+    'git -c user.name=A\\ B -C ../other commit -qm x',
+    'git --namespace=foo -C ../other commit -qm x',
     'bash -c "cd ../x && git commit -qm y"',
     'out="$(cd ../x; git commit -qm y)"',
     'GIT_DIR=/x/.git git commit -qm x',
@@ -93,6 +102,9 @@ test('a folder change counts where a command starts or before git\'s subcommand,
   for (const command of [
     'git commit -q --amend -C HEAD',
     'git commit -qC abc123',
+    'git --no-pager commit -C HEAD',
+    'git --namespace foo commit -C HEAD',
+    'git --namespace -C commit -qm x',
     'grep -C3 TODO a.ts && git commit -qm x',
     'ls -C && git commit -qm x',
     'git commit -qm "Make cd work in scripts"',
@@ -145,11 +157,17 @@ const world = (on: On, $: Engine, tokens: number): Seen => {
 
 /**
  * `claude plugin test` at the repo root also runs this file, against the root plugin. These tests need the Code Mode
- * plugin's hooks, so they return at once there: the skill text comes back unanswered when this plugin isn't loaded.
- * `cd code-mode && claude plugin test .` runs them for real.
+ * plugin's hooks, so they return at once there: the skill text comes back unanswered when this plugin isn't loaded,
+ * and the root plugin's `mark` tool answers. When neither plugin answers, the test fails, so a Code Mode plugin that
+ * doesn't load can't pass unseen. `cd code-mode && claude plugin test .` runs them for real.
  */
-const isCodeModeLoaded = async ($: Engine) =>
-  (await $.skill.prompt({ skill: markSkill, text: skillText('not a state') } as never)).text !== skillText('not a state')
+const isCodeModeLoaded = async ($: Engine) => {
+  if ((await $.skill.prompt({ skill: markSkill, text: skillText('not a state') } as never)).text !== skillText('not a state')) return true
+  // An invalid state: the root plugin stores nothing for it.
+  const rootAnswer = await $.tool.call({ tool: 'mcp__compact-timing__mark', state: 'not a state' } as never).catch(() => null)
+  if (typeof rootAnswer?.result === 'string' && rootAnswer.result.startsWith('The mark was not set')) return false
+  throw new Error('Neither the Code Mode plugin nor the root plugin answered: the plugin under test did not load.')
+}
 
 const endTurn = ($: Engine) => $.turn.complete({ reason: 'answer', answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't1' })
 
@@ -325,6 +343,57 @@ test("a subagent's pending call is dropped when its turn ends, so it can't be ma
   expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy') } as never)).text).toBe('The mark is `busy`.')
   await endTurn($)
   expect(seen.compacts).toEqual([])
+})
+
+test("where the words decide, a script's commit commands in separate rows get one reminder until the next script", async ($, on) => {
+  const seen = world(on, $, 250_000)
+  if (!(await isCodeModeLoaded($))) return
+  // `cd` first: the session folder's reflog can't tell, so each empty result reads as a quiet commit.
+  const script = 'await tools.Bash({ command: "cd ../x && git commit -qm one" }); await tools.Bash({ command: "cd ../x && git commit -qm two" })'
+  await callRow($, [{ id: 'toolu_24', name: 'REPL', input: { code: script } }])
+  await callRow($, [{ id: 'repl_7', name: 'Bash', input: { command: 'cd ../x && git commit -qm one' } }])
+  await resultRow($, 'repl_7', '')
+  await callRow($, [{ id: 'repl_8', name: 'Bash', input: { command: 'cd ../x && git commit -qm two' } }])
+  await resultRow($, 'repl_8', '')
+  expect(seen.notes).toHaveLength(1)
+  // The next script that may commit gets its own reminder, in the same turn; the turn's end clears the script too.
+  await callRow($, [{ id: 'toolu_25', name: 'REPL', input: { code: script } }])
+  await callRow($, [{ id: 'repl_9', name: 'Bash', input: { command: 'cd ../x && git commit -qm three' } }])
+  await resultRow($, 'repl_9', '')
+  expect(seen.notes).toHaveLength(2)
+  await endTurn($)
+  await callRow($, [{ id: 'repl_10', name: 'Bash', input: { command: 'cd ../x && git commit -qm four' } }])
+  await resultRow($, 'repl_10', '')
+  expect(seen.notes).toHaveLength(3)
+  await endTurn($)
+  await callRow($, [{ id: 'toolu_28', name: 'REPL', input: { code: script } }])
+  await callRow($, [{ id: 'repl_12', name: 'Bash', input: { command: 'cd ../x && git commit -qm four-b' } }])
+  await resultRow($, 'repl_12', '')
+  await callRow($, [{ id: 'repl_13', name: 'Bash', input: { command: 'cd ../x && git commit -qm four-c' } }])
+  await resultRow($, 'repl_13', '')
+  expect(seen.notes).toHaveLength(4)
+  // A direct commit call is not held back by a script's reminder.
+  await callRow($, [{ id: 'toolu_26', name: 'REPL', input: { code: script } }])
+  await callRow($, [{ id: 'repl_11', name: 'Bash', input: { command: 'cd ../x && git commit -qm five' } }])
+  await resultRow($, 'repl_11', '')
+  await callRow($, [{ id: 'toolu_27', name: 'Bash', input: { command: 'git commit -m six' } }])
+  expect(await resultRow($, 'toolu_27', '[main abc1234] six')).toContain('this commit saved work')
+  expect(seen.notes).toHaveLength(5)
+})
+
+test("the scripts of one step get one reminder, also for a later commit in another row", async ($, on) => {
+  const seen = world(on, $, 250_000)
+  if (!(await isCodeModeLoaded($))) return
+  await callRow($, [
+    { id: 'toolu_29', name: 'REPL', input: { code: 'await tools.Bash({ command: "git commit -qm one" })' } },
+    { id: 'toolu_30', name: 'REPL', input: { code: 'await tools.Bash({ command: "cd ../other && git commit -qm two" })' } },
+  ])
+  seen.reflog.unshift(entry('commit: one'))
+  await callRow($, [{ id: 'repl_14', name: 'Bash', input: { command: 'git commit -qm one' } }])
+  await resultRow($, 'repl_14', '')
+  await callRow($, [{ id: 'repl_15', name: 'Bash', input: { command: 'cd ../other && git commit -qm two' } }])
+  await resultRow($, 'repl_15', '')
+  expect(seen.notes).toHaveLength(1)
 })
 
 test("a script's commit command that committed nothing gets no reminder", async ($, on) => {
