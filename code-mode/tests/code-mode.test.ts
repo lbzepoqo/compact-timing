@@ -2,11 +2,14 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { markArgsLine, markCallOf, markSkill, matchMarkCall, parseMarkArgs } from '../hooks/logic'
+import { markArgsLine, markCallOf, markSkill, matchMarkCall, parseMarkArgs, scriptCommitLogged } from '../hooks/logic'
 
 // The skill's text as the engine expands it: its body, the arguments in place of `$ARGUMENTS`.
 const skillText = (args: string) =>
   `Base directory for this skill: /plugins/compact-timing-code-mode/skills/mark\n\nIf this text reaches you, the plugin did not answer.\n\n${markArgsLine}\n${args}\n`
+
+// A line of `git reflog --date=unix --format=%gd%x09%gs`, made now unless a time is given.
+const entry = (subject: string, time = Math.floor(Date.now() / 1000)) => `HEAD@{${time}}\t${subject}`
 
 test('the skill arguments give the state on the first line and the focus below it', () => {
   expect(parseMarkArgs(skillText('boundary\nNext: deploy.\nOpen: the port.'))).toEqual({
@@ -28,26 +31,36 @@ test('a focus line that started with `!` gets it back from the escape the engine
 })
 
 test('a call that may run the skill is recorded with whose it is, and matched by its arguments', () => {
-  expect(markCallOf({ id: 'toolu_1', name: 'Skill', input: { skill: markSkill, args: 'busy\r\nx\n' } }, false)).toEqual({ isSubagent: false, args: 'busy\nx' })
-  expect(markCallOf({ id: 'toolu_2', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args })` } }, true)).toEqual({ isSubagent: true })
+  expect(markCallOf({ id: 'toolu_1', name: 'Skill', input: { skill: markSkill, args: 'busy\r\nx\n' } }, undefined)).toEqual({ args: 'busy\nx' })
+  expect(markCallOf({ id: 'toolu_2', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args })` } }, 'agent-1')).toEqual({ agentId: 'agent-1' })
   // JavaScript that does not name the skill, another skill, and the record of a call JavaScript already made: none.
-  expect(markCallOf({ id: 'toolu_3', name: 'REPL', input: { code: 'await tools.Read({ file_path: "a" })' } }, true)).toBe(null)
-  expect(markCallOf({ id: 'toolu_4', name: 'Skill', input: { skill: 'other:mark', args: 'busy' } }, false)).toBe(null)
-  expect(markCallOf({ id: 'repl_5', name: 'Skill', input: { skill: markSkill, args: 'busy' } }, false)).toBe(null)
+  expect(markCallOf({ id: 'toolu_3', name: 'REPL', input: { code: 'await tools.Read({ file_path: "a" })' } }, 'agent-1')).toBe(null)
+  expect(markCallOf({ id: 'toolu_4', name: 'Skill', input: { skill: 'other:mark', args: 'busy' } }, undefined)).toBe(null)
+  expect(markCallOf({ id: 'repl_5', name: 'Skill', input: { skill: markSkill, args: 'busy' } }, undefined)).toBe(null)
 
   // A script that starts a subagent names the skill in the subagent's prompt, without calling it.
-  expect(markCallOf({ id: 'toolu_6', name: 'REPL', input: { code: `await tools.Agent({ prompt: 'call ${markSkill}' })` } }, false)).toBe(null)
+  expect(markCallOf({ id: 'toolu_6', name: 'REPL', input: { code: `await tools.Agent({ prompt: 'call ${markSkill}' })` } }, undefined)).toBe(null)
 
-  const pending = [{ isSubagent: false }, { isSubagent: true }, { isSubagent: false, args: 'boundary\nmain' }, { isSubagent: true, args: 'busy' }]
+  const pending = [{}, { agentId: 'agent-1' }, { args: 'boundary\nmain' }, { agentId: 'agent-1', args: 'busy' }]
   expect(matchMarkCall(pending, 'boundary\nmain')).toBe(2)
   // The newest script: the main one that started a subagent runs until the subagent's script is done.
   expect(matchMarkCall(pending, 'boundary\nwritten in JavaScript')).toBe(1)
-  expect(matchMarkCall([{ isSubagent: false, args: 'busy' }], 'boundary')).toBe(-1)
-  expect(matchMarkCall([], 'busy')).toBe(-1)
+  expect(matchMarkCall([{ args: 'busy' }], 'boundary')).toBe(-1)
 })
 
-// A line of `git reflog --date=unix --format=%gd%x09%gs`, made now unless a time is given.
-const entry = (subject: string, time = Math.floor(Date.now() / 1000)) => `HEAD@{${time}}\t${subject}`
+test("a script's commit is judged by the reflog only where it can tell", () => {
+  const now = Date.now()
+  const reflog = { exitCode: 0, stdout: `${entry('commit: Fix the parser', Math.floor(now / 1000))}\n` }
+  expect(scriptCommitLogged(reflog, now - 1000, now + 1000, 'git commit -qm "Fix the parser"')).toBe(true)
+  // Another commit of the same script, with nothing staged: the reflog's commit is not its subject.
+  expect(scriptCommitLogged(reflog, now - 1000, now + 1000, 'git commit -qm "Second change"')).toBe(false)
+  // No subject to compare (`-F`): any commit since the script started counts.
+  expect(scriptCommitLogged(reflog, now - 1000, now + 1000, 'git commit -qF msg.txt')).toBe(true)
+  // Another repository, or a folder that is not one: the words decide.
+  expect(scriptCommitLogged(reflog, now - 1000, now + 1000, 'cd ~/other && git commit -qm "Fix the parser"')).toBe(null)
+  expect(scriptCommitLogged({ exitCode: 128, stdout: '' }, now - 1000, now + 1000, 'git commit -qm x')).toBe(null)
+  expect(matchMarkCall([], 'busy')).toBe(-1)
+})
 
 // `reflog`: HEAD's reflog, newest first, as `git reflog` prints it; a test adds to it when its command commits.
 type Seen = { compacts: string[]; notes: string[]; prompts: string[]; reflog: string[] }

@@ -40,7 +40,7 @@ export type SessionRecord = { requests: string[]; omittedRequests: number; files
 export const emptyRecord: SessionRecord = { requests: [], omittedRequests: 0, files: [], omittedFiles: 0 }
 export const maxCommitCalls = 200
 // The reflog read runs after the call, before its result goes back to the model.
-const reflogTimeout = 3000
+export const reflogTimeout = 3000
 
 /** The tool input as the model sends it, or null when the state is not one of the two. */
 export const parseMark = (input: { state?: unknown; focus?: unknown; resume?: unknown; userSteps?: unknown }): Mark | null => {
@@ -967,25 +967,29 @@ export const parseMarkArgs = (skillText: string): Mark | null => {
   return parseMark({ state: stateWords[0], resume: stateWords.slice(1).includes('resume'), focus: focusLines.join('\n') })
 }
 
+/** A call the model's Code Mode JavaScript made: recorded after the script ran, with no output. */
+export const isScriptCallId = (id: unknown) => typeof id === 'string' && id.startsWith('repl_')
+
 /**
  * A call that may run the mark skill, from the model row that holds it: a direct `Skill` call with its arguments, or
  * Code Mode JavaScript that calls `tools.Skill` with the skill's name, whose arguments the plugin can't read from the
- * code. `isSubagent` is what the skill's own hook can't tell, since it gets no agent id.
+ * code. `agentId` is the subagent's, absent for the main conversation: what the skill's own hook can't tell.
  */
-export type MarkCall = { isSubagent: boolean; args?: string }
+export type MarkCall = { agentId?: string; args?: string }
 
 /** Kept per session, oldest first, so a call that never ran the skill can't grow the stored state without end. */
 export const maxMarkCalls = 20
 
 /** The mark call a row holds, or null. A call the model's JavaScript made is recorded after it ran: not counted. */
-export const markCallOf = (use: { [field: string]: unknown }, isSubagent: boolean): MarkCall | null => {
-  if (typeof use.id === 'string' && use.id.startsWith('repl_')) return null
+export const markCallOf = (use: { [field: string]: unknown }, agentId: string | undefined): MarkCall | null => {
+  if (isScriptCallId(use.id)) return null
+  const owner = agentId === undefined ? {} : { agentId }
   const input = (use.input ?? {}) as Record<string, unknown>
   if (use.name === 'Skill' && input.skill === markSkill)
-    return { isSubagent, args: typeof input.args === 'string' ? input.args.replace(/\r\n?/g, '\n').trim() : '' }
+    return { ...owner, args: typeof input.args === 'string' ? input.args.replace(/\r\n?/g, '\n').trim() : '' }
   // Naming the skill is not enough: a script that starts a subagent names it in the subagent's prompt.
   if (use.name === 'REPL' && typeof input.code === 'string' && input.code.includes('tools.Skill') && input.code.includes(markSkill))
-    return { isSubagent }
+    return owner
   return null
 }
 
@@ -1001,4 +1005,25 @@ export const matchMarkCall = (pending: readonly MarkCall[], args: string): numbe
     if (script === -1 && pending[index]?.args === undefined) script = index
   }
   return script
+}
+
+/** A shell command of the main conversation whose result has not come yet, kept by call id. */
+export type PendingCommand = { tool: string; command: string }
+
+/** Whether a command may commit somewhere other than the session folder's repository. */
+export const mayChangeFolder = (command: string) => mayNamePath(command) || /(^|[\s;&|(])(cd|pushd)\s|\s-C\s/.test(command)
+
+/**
+ * Whether a commit command a script ran made a commit, by the session folder's HEAD reflog since the script started:
+ * the commit's subject must be one the command gives, when it gives one, so a script's other commit doesn't count.
+ * Null when the reflog can't tell: the folder is not a repository, or the command may commit in another one.
+ */
+export const scriptCommitLogged = (
+  run: { exitCode: number; stdout: string } | { error: string },
+  startedAt: number,
+  endedAt: number,
+  command: string,
+): boolean | null => {
+  if (!isGitAnswer(run) || mayChangeFolder(command)) return null
+  return isCommitLogged(run, startedAt, endedAt, commitSubjects(command).length > 0 ? command : undefined)
 }

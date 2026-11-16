@@ -7,7 +7,7 @@ import {
   contextNote,
   contextNoteDue,
   isCommitCall,
-  isCommitFound,
+  isScriptCallId,
   isRemindableCommit,
   limitOption,
   markArgsText,
@@ -21,8 +21,12 @@ import {
   ownCompactFailure,
   parseMarkArgs,
   pluginCompactArgs,
+  reflogArguments,
+  reflogTimeout,
   report,
   resumePrompt,
+  runGit,
+  scriptCommitLogged,
   shouldNudge,
   shouldRemind,
   skillAddResume,
@@ -32,7 +36,7 @@ import {
   turnEnd,
   unfinishedStep,
 } from './logic'
-import type { Holds, Limits, Mark, MarkCall, OwnCompact, Same } from './logic'
+import type { Holds, Limits, Mark, MarkCall, OwnCompact, PendingCommand, Same } from './logic'
 
 // compact-timing for Code Mode. Claude Code turns Code Mode off when a mod listens to `tool.call` (or another tool
 // event), and only a `tool.call` hook can answer a tool a plugin registers. So the model sets the mark with a skill,
@@ -46,13 +50,22 @@ const noted = atom({ plugin: 'compact-timing-code-mode', key: 'noted' } as const
 const nudged = atom({ plugin: 'compact-timing-code-mode', key: 'nudged' } as const, false)
 const resumes = atom({ plugin: 'compact-timing-code-mode', key: 'resumes' } as const, 0)
 const ownCompact = atom({ plugin: 'compact-timing-code-mode', key: 'ownCompact' } as const, null as OwnCompact)
-const commands = atom({ plugin: 'compact-timing-code-mode', key: 'commands' } as const, {} as Record<string, { tool: string; command: string }>)
+const commands = atom({ plugin: 'compact-timing-code-mode', key: 'commands' } as const, {} as Record<string, PendingCommand>)
 const markCalls = atom({ plugin: 'compact-timing-code-mode', key: 'markCalls' } as const, [] as MarkCall[])
 const scriptStartedAt = atom({ plugin: 'compact-timing-code-mode', key: 'scriptStartedAt' } as const, 0)
 
 // The atoms check that the logic's shapes fit the stored ones; these check the other way, so neither can drift.
 type Stored = PluginState['compact-timing-code-mode']
-export type StoredShapesMatch = Holds<[Same<Stored['mark'], Mark | null>, Same<Stored['ownCompact'], OwnCompact>, Same<Stored['markCalls'][number], MarkCall>] extends [true, true, true] ? true : false>
+export type StoredShapesMatch = Holds<
+  [
+    Same<Stored['mark'], Mark | null>,
+    Same<Stored['ownCompact'], OwnCompact>,
+    Same<Stored['markCalls'][number], MarkCall>,
+    Same<Stored['commands'][string], PendingCommand>,
+  ] extends [true, true, true, true]
+    ? true
+    : false
+>
 
 // Kept per session, so a call whose result never came (an interrupted turn) can't grow the stored state without end.
 const maxCommands = 50
@@ -86,10 +99,11 @@ export const register: Register = (on, options) => {
     if (e.door === 'response') {
       const uses = blocks.filter(block => block.type === 'tool_use')
       const isSubagent = e.agentId !== undefined
-      const calls = uses.flatMap(use => markCallOf(use, isSubagent) ?? [])
+      const calls = uses.flatMap(use => markCallOf(use, e.agentId) ?? [])
       if (calls.length > 0) await update($, markCalls, previous => [...previous, ...calls].slice(-maxMarkCalls)).catch(() => undefined)
-      if (!isSubagent && uses.some(use => use.name === 'REPL' && !String(use.id).startsWith('repl_')))
-        await update($, scriptStartedAt, () => Date.now()).catch(() => undefined)
+      // Only a script that may commit needs its start time; most Code Mode steps are scripts.
+      const isCommitScript = (use: Block) => use.name === 'REPL' && !isScriptCallId(use.id) && String((use.input as { code?: unknown })?.code ?? '').includes('commit')
+      if (!isSubagent && uses.some(isCommitScript)) await update($, scriptStartedAt, () => Date.now()).catch(() => undefined)
       const commits = isSubagent
         ? []
         : uses.flatMap(use => {
@@ -124,15 +138,17 @@ export const register: Register = (on, options) => {
         $.session.usage().then(usage => usage.context.tokens).catch(() => undefined),
       ])
       let isResumeReminded = false
+      // A call a script made is recorded with no output, so whether it committed is read from HEAD's reflog since the
+      // script started, once for the row. Under a `busy` mark the words are enough, as with a direct call. Without a
+      // start time, or where the reflog can't tell (`scriptCommitLogged`), the words decide, as for a silent direct call.
+      const isScriptRow = [...calls.keys()].some(block => isScriptCallId(block.tool_use_id))
+      const startedAt = isScriptRow && current?.state !== 'busy' && shouldRemind(current, tokens, limits) ? await read($, scriptStartedAt).catch(() => 0) : 0
+      const reflog = startedAt > 0 ? await runGit($, reflogArguments, { timeoutMs: reflogTimeout }) : null
+      const endedAt = Date.now()
       for (const [block, call] of calls) {
         if (block.is_error === true || !shouldRemind(current, tokens, limits)) continue
-        const input = { command: call.command }
-        // A call a script made is recorded with no output, so whether it committed is read from HEAD's reflog, from
-        // when the script started. Under a `busy` mark the words are enough, as with a direct call.
-        // Without a start time (a script the plugin did not see start) the words decide, as for a silent direct call.
-        const startedAt = String(block.tool_use_id).startsWith('repl_') && current?.state !== 'busy' ? await read($, scriptStartedAt).catch(() => 0) : 0
-        const isCommitted =
-          startedAt > 0 ? await isCommitFound($, call.command, startedAt) : isRemindableCommit(call.tool, input, resultText(block.content), current)
+        const logged = reflog !== null && isScriptCallId(block.tool_use_id) ? scriptCommitLogged(reflog, startedAt, endedAt, call.command) : null
+        const isCommitted = logged ?? isRemindableCommit(call.tool, { command: call.command }, resultText(block.content), current)
         if (isCommitted) {
           add(block, commitReminder(markSkillName, current, skillAddResume))
           // Only the reminder for a mark that is not busy names `resume`, so only it says what the nudge says.
@@ -160,7 +176,7 @@ export const register: Register = (on, options) => {
     const content = blocks.map(block => {
       const texts = notes.get(block)
       if (texts === undefined) return block
-      if (String(block.tool_use_id).startsWith('repl_')) {
+      if (isScriptCallId(block.tool_use_id)) {
         later.push(...texts)
         return block
       }
@@ -177,7 +193,7 @@ export const register: Register = (on, options) => {
   on('skill.prompt', async ($, e, next) => {
     const result = await next(e)
     if (e.skill !== markSkill) return result
-    // The oldest pending call with these arguments ran the skill; none when the user typed it.
+    // Which pending call ran the skill (`matchMarkCall`); none when the user typed it.
     const args = markArgsText(e.text) ?? ''
     let call: MarkCall | undefined
     await update($, markCalls, previous => {
@@ -185,7 +201,7 @@ export const register: Register = (on, options) => {
       call = previous[index]
       return index === -1 ? previous : previous.filter((_, other) => other !== index)
     }).catch(() => undefined)
-    if ((call as MarkCall | undefined)?.isSubagent === true) return { text: 'Only the main conversation sets the compaction mark.' }
+    if ((call as MarkCall | undefined)?.agentId !== undefined) return { text: 'Only the main conversation sets the compaction mark.' }
     const parsed = parseMarkArgs(e.text)
     if (!parsed) return { text: 'The mark was not set: the first line of the arguments must be `boundary` or `busy`.' }
     const tokens = parsed.resume ? await $.session.usage().then(usage => usage.context.tokens).catch(() => undefined) : undefined
@@ -196,9 +212,10 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    // A call of this agent that never ran the skill must not be matched to a later one.
+    await update($, markCalls, previous => previous.filter(call => call.agentId !== e.agentId)).catch(() => undefined)
     if (e.agentId !== undefined) return result
-    // A main-conversation call that names the skill but never ran it must not be matched to a later one.
-    await update($, markCalls, previous => previous.filter(call => call.isSubagent)).catch(() => undefined)
+    await update($, scriptStartedAt, () => 0).catch(() => undefined)
     try {
       const tokens = (await $.session.usage()).context.tokens
       let current = null as Mark | null
