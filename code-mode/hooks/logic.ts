@@ -1,4 +1,4 @@
-import type { ProcessRunInit, ProcessRunResult, SessionMessage, ToolUseSummary } from 'claude-code'
+import type { EngineInterface, EventName, Hook, ProcessRunInit, ProcessRunResult, SessionCompactResult, SessionMessage, ToolUseSummary } from 'claude-code'
 
 // The logic both entries share: compact-timing's `hooks/register.ts`, which answers the `mark` tool in a `tool.call` hook,
 // and the Code Mode entry in this folder, which has no tool hook. It lives here because a plugin cannot import a file
@@ -1097,4 +1097,189 @@ export const scriptCommitLogged = (
   if (!isGitAnswer(run)) return null
   if (isCommitLogged(run, startedAt, endedAt)) return true
   return mayChangeFolder(command) ? null : false
+}
+
+// The hooks both entries run the same way, each with its own atoms and plugin name: the end of a turn, the context note
+// on a request, the plugin's own `/compact` and the compaction. Only compact-timing has pointer mode, which it adds
+// through `PointerStep` and around `markInstructions` and `settleCompaction`.
+
+type HookArgs<E extends EventName> = Parameters<Hook<E>>
+
+/** A stored value as the shared hooks reach it. */
+export type Cell<T> = { read: () => Promise<T>; update: (change: (value: T) => T) => Promise<T> }
+
+/**
+ * The values the shared hooks keep, each plugin's under its own name. Each plugin builds these from its own atoms: the
+ * validator takes a `read` or `update` only of an atom it can see in the file that makes the call.
+ */
+export type TurnCells = {
+  mark: Cell<Mark | null>
+  noted: Cell<boolean>
+  nudged: Cell<boolean>
+  resumes: Cell<number>
+  ownCompact: Cell<OwnCompact>
+}
+
+type SessionUsage = Awaited<ReturnType<EngineInterface['session']['usage']>>
+
+/**
+ * Pointer mode's part of the plugin's own compaction: `prepare` stores the parts for the compaction hook and answers
+ * whether it stored any, `clear` drops them once the compaction ran.
+ */
+/** What pointer mode adds to the stored outcome of the plugin's own compaction. */
+export type PointerOutcome = Omit<Exclude<OwnCompact, 'pending' | null>, 'skip'>
+
+export type PointerStep = { prepare: (marked: Mark | null, tokens: number, usage: SessionUsage) => Promise<boolean>; clear: () => Promise<void> }
+
+/**
+ * The main conversation's end of a turn: settles the mark, and when it calls for a compaction runs the plugin's own
+ * `/compact`, then resumes with an automatic prompt when the mark asked for that. Reports its own failure.
+ */
+export async function compactAtTurnEnd(
+  $: EngineInterface,
+  cells: TurnCells,
+  plugin: string,
+  limits: Limits,
+  isAborted: boolean,
+  pointerStep?: PointerStep,
+): Promise<void> {
+  try {
+    const usage = await $.session.usage()
+    const tokens = usage.context.tokens
+    let current = null as Mark | null
+    let decision = { next: null as Mark | null, compact: false, resume: false }
+    // One read-modify-write, so a mark set meanwhile is neither lost nor judged by the old value.
+    await cells.mark.update(previous => {
+      current = previous
+      decision = turnEnd(previous, tokens, isAborted, limits)
+      return decision.next
+    })
+    if (!decision.compact || tokens === undefined) return
+    // `current` is assigned inside the callback above, which TypeScript does not follow.
+    const marked = current as Mark | null
+    $.ui.toast(`${plugin}: compacting at ${thousands(tokens)} tokens${decision.resume ? ', then resuming' : ''}`)
+    // `/compact` rather than `$.session.compact()`, which rejects in a headless or SDK session (T3 Code, `-p`).
+    // The command runs once the session is idle and resolves after the compaction, in the terminal and the SDK alike.
+    // `markOwnCompact` marks this run `pending`, and `settleCompaction` stores its outcome.
+    await cells.ownCompact.update((): OwnCompact => null)
+    const isPrepared = pointerStep ? await pointerStep.prepare(marked, tokens, usage) : false
+    let outcome: OwnCompact = null
+    try {
+      await $.command.run({ command: 'compact', args: pluginCompactArgs(marked, tokens) })
+    } finally {
+      // Its own failure must not hide the command's.
+      await cells.ownCompact.update(previous => {
+        outcome = previous
+        return null
+      }).catch(() => undefined)
+      if (pointerStep) await pointerStep.clear().catch(() => undefined)
+    }
+    const failure = ownCompactFailure(outcome)
+    if (failure !== null) {
+      report($, `${plugin}: ${failure}`)
+      return
+    }
+    const settled = outcome as OwnCompact
+    const isPointer = typeof settled === 'object' && settled?.isPointer === true
+    const reason = typeof settled === 'object' ? settled?.summaryReason : undefined
+    if (pointerStep && reason) $.ui.log(`${plugin}: pointer mode made a summary and added the pointer's parts after it, because ${reason}`)
+    else if (pointerStep && isPrepared && !isPointer) $.ui.log(`${plugin}: pointer mode fell back to a summary for this compaction`)
+    if (!decision.resume) return
+    let count = 0
+    await cells.resumes.update(previous => (count = previous + 1))
+    if (count > maxResumes) {
+      report($, `${plugin}: stopped after ${maxResumes} automatic resumes in a row; type "continue" to go on`)
+      return
+    }
+    // Not awaited: a plugin's prompt runs once the session is idle, which is after this hook returns.
+    void $.prompt.submit({ text: resumePrompt(marked?.focus ?? '', isPointer) }).catch(error =>
+      report($, `${plugin}: resume prompt failed (${error instanceof Error ? error.message : String(error)})`),
+    )
+  } catch (error) {
+    report($, `${plugin}: end of turn failed (${error instanceof Error ? error.message : String(error)})`)
+  }
+}
+
+/**
+ * Whether a prompt is a request the user typed (or sent from a remote or SDK host): a task notification, a scheduled
+ * prompt or a slash command is not, and would use up the context note without the user's next topic seeing it.
+ */
+export const isUserPrompt = (event: HookArgs<'prompt.submit'>[1]) =>
+  ['composer', 'bridge', 'sdk'].includes(event.origin.kind) && event.command === undefined && event.isMeta === undefined
+
+/**
+ * A request from the user restarts the count of automatic resumes, then runs `onUserRequest`, and gets the context note
+ * when one is due.
+ */
+export async function promptWithNote(
+  $: HookArgs<'prompt.submit'>[0],
+  event: HookArgs<'prompt.submit'>[1],
+  next: HookArgs<'prompt.submit'>[2],
+  cells: TurnCells,
+  limits: Limits,
+  isContextNoteOn: boolean,
+  markName: string,
+  onUserRequest?: () => Promise<void>,
+): Promise<Awaited<ReturnType<Hook<'prompt.submit'>>>> {
+  const isUserRequest = isUserPrompt(event)
+  if (isUserRequest) await cells.resumes.update(() => 0).catch(() => undefined)
+  if (isUserRequest && onUserRequest) await onUserRequest().catch(() => undefined)
+  if (!isContextNoteOn || !isUserRequest) return next(event)
+  const [previous, tokens] = await Promise.all([
+    cells.noted.read().catch(() => undefined),
+    $.session.usage().then(usage => usage.context.tokens).catch(() => undefined),
+  ])
+  if (previous === undefined) return next(event)
+  const decision = contextNoteDue(tokens, previous, limits)
+  if (decision.noted !== previous) {
+    const isStored = await cells.noted.update(() => decision.noted).then(() => true, () => false)
+    // A note whose flag was not stored would come again with every prompt.
+    if (!isStored) return next(event)
+  }
+  if (!decision.due || tokens === undefined) return next(event)
+  return next({ ...event, context: [...(event.context ?? []), contextNote(tokens, markName)] })
+}
+
+/** Marks only the plugin's own `/compact`, while it runs, so a `/compact` the user queued is not taken for it. */
+export async function markOwnCompact(event: HookArgs<'command.run'>[1], ownCompact: Cell<OwnCompact>, plugin: string) {
+  if (event.command === 'compact' && event.origin.kind === 'plugin' && event.origin.name === plugin) await ownCompact.update((): OwnCompact => 'pending')
+}
+
+/**
+ * The compaction with the mark's instructions added: the main conversation's, except another plugin's direct
+ * compaction, which carries its own. The plugin's own runs as `/compact` (`manual`).
+ */
+export async function markInstructions(
+  event: HookArgs<'session.compact'>[1],
+  mark: Cell<Mark | null>,
+  markName: string,
+): Promise<HookArgs<'session.compact'>[1]> {
+  if (event.agentId !== undefined || event.trigger === 'plugin') return event
+  const current = await mark.read().catch(() => null)
+  return { ...event, instructions: compactInstructions(event.trigger, event.instructions, current, unfinishedStep(event.messages, markName)) }
+}
+
+/**
+ * After a compaction: stores the outcome of the plugin's own, with what pointer mode adds to it, and clears the mark
+ * when the compaction replaced the conversation (also the automatic one at the hard limit; a precompute installs
+ * nothing, so the mark stays).
+ */
+export async function settleCompaction(
+  event: HookArgs<'session.compact'>[1],
+  result: SessionCompactResult,
+  cells: TurnCells,
+  pointerOutcome: PointerOutcome = {},
+) {
+  if (event.agentId !== undefined) return
+  if (event.trigger === 'manual')
+    await cells.ownCompact.update(previous => (previous === 'pending' ? { skip: result.skip ?? null, ...pointerOutcome } : previous)).catch(
+      () => undefined,
+    )
+  if (event.trigger !== 'precompute' && result.skip === undefined) {
+    await cells.mark.update(() => null).catch(() => undefined)
+    // The usage figure stays at the pre-compaction size until the next response, so the note is held until a prompt
+    // reads a size below boundaryTokens.
+    await cells.noted.update(() => true).catch(() => undefined)
+    await cells.nudged.update(() => false).catch(() => undefined)
+  }
 }

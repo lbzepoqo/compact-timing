@@ -1,42 +1,38 @@
 import { atom, read, update } from 'claude-code'
-import type { PluginState, Register } from 'claude-code'
+import type { PluginState, Register, StateDollar } from 'claude-code'
 import {
   armedMark,
   commitReminder,
-  compactInstructions,
+  compactAtTurnEnd,
   contextNote,
-  contextNoteDue,
   isCommitCall,
-  isScriptCallId,
   isRemindableCommit,
+  isScriptCallId,
   limitOption,
   markArgsText,
   markCallOf,
-  matchMarkCall,
-  maxMarkCalls,
+  markInstructions,
+  markOwnCompact,
   markResult,
   markSkill,
   markSkillName,
-  maxResumes,
-  ownCompactFailure,
+  matchMarkCall,
+  maxMarkCalls,
   parseMarkArgs,
-  pluginCompactArgs,
+  promptWithNote,
   reflogArguments,
   reflogTimeout,
   report,
-  resumePrompt,
   runGit,
   scriptCommitLogged,
+  settleCompaction,
   shouldNudge,
   shouldRemind,
+  sizeNudge,
   skillAddResume,
   skillResumeCall,
-  sizeNudge,
-  thousands,
-  turnEnd,
-  unfinishedStep,
 } from './logic'
-import type { Holds, Limits, Mark, MarkCall, OwnCompact, PendingCommand, Same } from './logic'
+import type { Holds, Limits, Mark, MarkCall, OwnCompact, PendingCommand, Same, TurnCells } from './logic'
 
 // compact-timing for Code Mode. Claude Code turns Code Mode off when a mod listens to `tool.call` (or another tool
 // event), and only a `tool.call` hook can answer a tool a plugin registers. So the model sets the mark with a skill,
@@ -94,6 +90,17 @@ const withText = (content: unknown, text: string): Block[] => [
   ...(typeof content === 'string' ? (content === '' ? [] : [{ type: 'text', text: content }]) : Array.isArray(content) ? (content as Block[]) : []),
   { type: 'text', text },
 ]
+
+/** This plugin's values for the hooks it shares with compact-timing. */
+function turnCells($: StateDollar): TurnCells {
+  return {
+    mark: { read: () => read($, mark), update: change => update($, mark, change) },
+    noted: { read: () => read($, noted), update: change => update($, noted, change) },
+    nudged: { read: () => read($, nudged), update: change => update($, nudged, change) },
+    resumes: { read: () => read($, resumes), update: change => update($, resumes, change) },
+    ownCompact: { read: () => read($, ownCompact), update: change => update($, ownCompact, change) },
+  }
+}
 
 export const register: Register = (on, options) => {
   const limits: Limits = {
@@ -250,93 +257,21 @@ export const register: Register = (on, options) => {
     // A failed read falls through to the write: a start time must not reach the next turn.
     const run = await read($, script).catch(() => null)
     if (run === null || run.startedAt !== 0 || run.reminded) await update($, script, () => idleScript).catch(() => undefined)
-    try {
-      const tokens = (await $.session.usage()).context.tokens
-      let current = null as Mark | null
-      let decision = { next: null as Mark | null, compact: false, resume: false }
-      // One read-modify-write, so a mark set meanwhile is neither lost nor judged by the old value.
-      await update($, mark, previous => {
-        current = previous
-        decision = turnEnd(previous, tokens, e.isAborted === true, limits)
-        return decision.next
-      })
-      if (!decision.compact || tokens === undefined) return result
-      // `current` is assigned inside the callback above, which TypeScript does not follow.
-      const marked = current as Mark | null
-      $.ui.toast(`${plugin}: compacting at ${thousands(tokens)} tokens${decision.resume ? ', then resuming' : ''}`)
-      await update($, ownCompact, (): OwnCompact => null)
-      let outcome: OwnCompact = null
-      try {
-        // `/compact` rather than `$.session.compact()`, which rejects in a headless or SDK session.
-        await $.command.run({ command: 'compact', args: pluginCompactArgs(marked, tokens) })
-      } finally {
-        await update($, ownCompact, previous => {
-          outcome = previous
-          return null
-        }).catch(() => undefined)
-      }
-      const failure = ownCompactFailure(outcome)
-      if (failure !== null) {
-        report($, `${plugin}: ${failure}`)
-        return result
-      }
-      if (!decision.resume) return result
-      let count = 0
-      await update($, resumes, previous => (count = previous + 1))
-      if (count > maxResumes) {
-        report($, `${plugin}: stopped after ${maxResumes} automatic resumes in a row; type "continue" to go on`)
-        return result
-      }
-      // Not awaited: a plugin's prompt runs once the session is idle, which is after this hook returns.
-      void $.prompt.submit({ text: resumePrompt(marked?.focus ?? '') }).catch(error =>
-        report($, `${plugin}: resume prompt failed (${error instanceof Error ? error.message : String(error)})`),
-      )
-    } catch (error) {
-      report($, `${plugin}: end of turn failed (${error instanceof Error ? error.message : String(error)})`)
-    }
+    await compactAtTurnEnd($, turnCells($), plugin, limits, e.isAborted === true)
     return result
   })
 
-  // Only a request the user typed (or sent from a remote or SDK host) gets the note.
-  on('prompt.submit', async ($, e, next) => {
-    const isUserRequest = ['composer', 'bridge', 'sdk'].includes(e.origin.kind) && e.command === undefined && e.isMeta === undefined
-    if (isUserRequest) await update($, resumes, () => 0).catch(() => undefined)
-    if (!isContextNoteOn || !isUserRequest) return next(e)
-    const [previous, tokens] = await Promise.all([
-      read($, noted).catch(() => undefined),
-      $.session.usage().then(usage => usage.context.tokens).catch(() => undefined),
-    ])
-    if (previous === undefined) return next(e)
-    const decision = contextNoteDue(tokens, previous, limits)
-    if (decision.noted !== previous) {
-      const isStored = await update($, noted, () => decision.noted).then(() => true, () => false)
-      if (!isStored) return next(e)
-    }
-    if (!decision.due || tokens === undefined) return next(e)
-    return next({ ...e, context: [...(e.context ?? []), contextNote(tokens, markSkillName)] })
-  })
+  on('prompt.submit', ($, e, next) => promptWithNote($, e, next, turnCells($), limits, isContextNoteOn, markSkillName))
 
-  // Only the plugin's own `/compact` is marked, while it runs, so a `/compact` the user queued is not taken for it.
   on('command.run', async ($, e, next) => {
-    if (e.command === 'compact' && e.origin.kind === 'plugin' && e.origin.name === plugin) await update($, ownCompact, (): OwnCompact => 'pending')
+    await markOwnCompact(e, turnCells($).ownCompact, plugin)
     return next(e)
   })
 
   on('session.compact', async ($, e, next) => {
-    if (e.agentId === undefined && e.trigger !== 'plugin') {
-      const current = await read($, mark).catch(() => null)
-      e = { ...e, instructions: compactInstructions(e.trigger, e.instructions, current, unfinishedStep(e.messages, 'Skill')) }
-    }
-    const result = await next(e)
-    if (e.agentId === undefined && e.trigger === 'manual')
-      await update($, ownCompact, previous => (previous === 'pending' ? { skip: result.skip ?? null } : previous)).catch(() => undefined)
-    // A compaction that replaces the conversation clears the mark; a precompute installs nothing, so the mark stays.
-    if (e.agentId === undefined && e.trigger !== 'precompute' && result.skip === undefined) {
-      await update($, mark, () => null).catch(() => undefined)
-      // The usage figure stays at the pre-compaction size until the next response.
-      await update($, noted, () => true).catch(() => undefined)
-      await update($, nudged, () => false).catch(() => undefined)
-    }
+    const cells = turnCells($)
+    const result = await next(await markInstructions(e, cells.mark, 'Skill'))
+    await settleCompaction(e, result, cells)
     return result
   })
 }
