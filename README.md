@@ -15,6 +15,8 @@ Restart Claude Code. The `lbzepoqo/claude-plugins` marketplace also lists it, as
 
 Keep Claude Code's own `autoCompactWindow` above `softTokens` (300k by default), for example `{ "autoCompactWindow": 500000 }`. It stays the hard limit when a `busy` mark is never cleared.
 
+**Not compatible with Code Mode.** Claude Code turns Code Mode off at startup when an installed mod listens to `tool.call` (and a few other tool events). This plugin has to: its `mark` tool is added with `$.tool.register`, and only a `tool.call` hook can answer it. So you choose one or the other: with this plugin enabled, Code Mode stays off. Disabling it brings Code Mode back only if none of your other mods listen to those events. Checked against Claude Code 2.1.325.
+
 ## How it works
 
 The plugin gives the model one tool, `mark`:
