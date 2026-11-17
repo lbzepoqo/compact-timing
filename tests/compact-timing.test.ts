@@ -64,16 +64,15 @@ test('an empty or misspelled limit falls back to the default', () => {
   expect(limitOption(undefined, 300_000)).toBe(300_000)
 })
 
-test('every compaction asks for the open user steps and the transcript search; only one Claude Code starts falls back to the focus', () => {
+test('every compaction asks for the open user steps and the transcript search; one without instructions falls back to the focus', () => {
   const busy = { state: 'busy' as const, focus: 'Keep the failing test name.', resume: false }
   const standing = `${openUserSteps}\n\n${transcriptSearch}`
-  expect(compactInstructions('auto', undefined, busy)).toBe(`Keep the failing test name.\n\n${standing}`)
-  expect(compactInstructions('precompute', ' ', busy)).toBe(`Keep the failing test name.\n\n${standing}`)
-  expect(compactInstructions('auto', 'the user text', busy)).toBe(`the user text\n\n${standing}`)
-  expect(compactInstructions('manual', undefined, busy)).toBe(standing)
-  expect(compactInstructions('manual', 'keep the plan', busy)).toBe(`keep the plan\n\n${standing}`)
-  expect(compactInstructions('plugin', 'Next: deploy.', null)).toBe(`Next: deploy.\n\n${standing}`)
-  expect(compactInstructions('auto', undefined, null)).toBe(standing)
+  // Claude Code's own compaction, and a bare `/compact` typed or sent by a host (T3 Code's idle compaction).
+  expect(compactInstructions(undefined, busy)).toBe(`Keep the failing test name.\n\n${standing}`)
+  expect(compactInstructions(' ', busy)).toBe(`Keep the failing test name.\n\n${standing}`)
+  expect(compactInstructions('the user text', busy)).toBe(`the user text\n\n${standing}`)
+  expect(compactInstructions('Next: deploy.', null)).toBe(`Next: deploy.\n\n${standing}`)
+  expect(compactInstructions(undefined, null)).toBe(standing)
 })
 
 test('the context note comes once at the boundary limit and again only after the context fell below it', () => {
@@ -127,7 +126,7 @@ test('the plugin compacts with /compact, its label and focus as the arguments, t
   expect(args).toBe(`${summaryLabel(boundary, 214_000)}\n\nNext: deploy.`)
   expect(pluginCompactArgs(null, 301_000)).toBe(summaryLabel(null, 301_000))
   // The compaction hook sees it as a typed /compact and adds the standing instructions after it.
-  expect(compactInstructions('manual', args, boundary)).toBe(`${args}\n\n${openUserSteps}\n\n${transcriptSearch}`)
+  expect(compactInstructions(args, boundary)).toBe(`${args}\n\n${openUserSteps}\n\n${transcriptSearch}`)
 })
 
 test('the plugin compaction counts only when its compaction hook saw it stand', () => {

@@ -275,8 +275,8 @@ test('a summary is asked to keep an unfinished step when the last shell command 
   expect(unfinishedStep([...session, ...reads(20)], markTool)).toBe(line)
   expect(unfinishedStep([...session, ...reads(21)], markTool)).toBe('')
   // After the given instructions, before the standing ones: the transcript search names the summary's last line.
-  expect(compactInstructions('manual', 'keep the plan', null, line)).toBe(`keep the plan\n\n${line}\n\n${openUserSteps}\n\n${transcriptSearch}`)
-  expect(compactInstructions('auto', undefined, null, '')).toBe(`${openUserSteps}\n\n${transcriptSearch}`)
+  expect(compactInstructions('keep the plan', null, line)).toBe(`keep the plan\n\n${line}\n\n${openUserSteps}\n\n${transcriptSearch}`)
+  expect(compactInstructions(undefined, null, '')).toBe(`${openUserSteps}\n\n${transcriptSearch}`)
 })
 
 test('the work entries hold what was said and each tool call, without the mark, the last reply and read results', () => {
@@ -1064,6 +1064,14 @@ test('pointer mode: Claude Code compactions, a typed /compact and a subagent kee
   await $.session.compact({ trigger: 'manual', messages } as never)
   await $.session.compact({ trigger: 'auto', messages, agentId: 'a1' } as never)
   expect(seen.summarized).toEqual(['auto', 'precompute', 'manual', 'auto'])
+})
+
+test('a bare /compact, typed or sent by a host such as T3 Code, keeps a busy step\'s focus', async ($, on) => {
+  const seen = world(on, $)
+  await start($)
+  await setMark($, { state: 'busy', focus: 'Keep the failing test name.' })
+  await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'x', toolUses: [] }] } as never)
+  expect(seen.instructions[0]).toBe(`Keep the failing test name.\n\n${openUserSteps}\n\n${transcriptSearch}`)
 })
 
 

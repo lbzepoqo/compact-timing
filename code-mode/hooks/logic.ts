@@ -883,14 +883,14 @@ const pointerSections = (parts: PointerParts, middle: readonly string[]) => [
 ]
 
 /**
- * Instructions for every compaction of the main conversation: the ones given, or the mark's focus for a compaction
- * Claude Code starts itself (trigger `auto` or `precompute`), followed by the request for an unfinished step when there
- * is one (`unfinishedStep`), the open user steps and the transcript search, which stays last since it names the
- * summary's last line. Only a `busy` mark outlives its turn, so the focus keeps the details of an unfinished step.
+ * Instructions for every compaction of the main conversation: the ones given, or the mark's focus when none are given
+ * (Claude Code's own compaction, a bare `/compact` typed or sent by a host such as T3 Code's idle compaction), followed
+ * by the request for an unfinished step when there is one (`unfinishedStep`), the open user steps and the transcript
+ * search, which stays last since it names the summary's last line. Only a `busy` mark outlives its turn, so the focus
+ * keeps the details of an unfinished step. The plugin's own `/compact` always gives instructions (its label).
  */
-export const compactInstructions = (trigger: string, instructions: string | undefined, current: Mark | null, unfinished = '') => {
-  const isEngine = trigger === 'auto' || trigger === 'precompute'
-  const given = instructions?.trim() || (isEngine ? current?.focus : '')
+export const compactInstructions = (instructions: string | undefined, current: Mark | null, unfinished = '') => {
+  const given = instructions?.trim() || current?.focus
   return [given, unfinished, openUserSteps, transcriptSearch].filter(Boolean).join('\n\n')
 }
 
@@ -1256,7 +1256,7 @@ export async function markInstructions(
 ): Promise<HookArgs<'session.compact'>[1]> {
   if (event.agentId !== undefined || event.trigger === 'plugin') return event
   const current = await mark.read().catch(() => null)
-  return { ...event, instructions: compactInstructions(event.trigger, event.instructions, current, unfinishedStep(event.messages, markName)) }
+  return { ...event, instructions: compactInstructions(event.instructions, current, unfinishedStep(event.messages, markName)) }
 }
 
 /**

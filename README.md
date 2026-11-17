@@ -65,7 +65,7 @@ Every summary of the main conversation, including the one for a `/compact` you t
 
 A third request is added when the last shell command failed, nothing was committed after it and at most 20 tool calls followed it (the mark tool's answer in pointer mode uses the same rule): if the step it belongs to is unfinished, keep what was being tried, the exact error text and what was already ruled out. The models tested do not set `busy` while debugging, so without it a compaction at `softTokens` can land inside a debugging step with nothing asking the summary to keep its details. A search that matched nothing counts as failed too, which is why the request is worded as a condition.
 
-When Claude Code compacts on its own (at `autoCompactWindow`, on a prompt that is too long, or while idle, including its precompute) and has no instructions of its own, the plugin passes the mark's focus as the instructions, so a `busy` step keeps what it needs.
+When Claude Code compacts on its own (at `autoCompactWindow`, on a prompt that is too long, or while idle, including its precompute), or a bare `/compact` runs, whether you type it or a host sends it (T3 Code's idle compaction), the plugin passes the mark's focus as the instructions, so a `busy` step keeps what it needs. A `/compact` with text of its own keeps that text instead, and another plugin's direct compaction and a subagent's get nothing added. Before 0.15.1 (Code Mode plugin 0.2.1) a bare `/compact` got no focus.
 
 ### How a plugin compaction shows up
 
