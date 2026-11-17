@@ -138,6 +138,13 @@ export const sizeNudge = (tokens: number, toolName: string, resumeCall = toolRes
   `compact-timing: the context holds ${thousands(tokens)} tokens, and the plugin can compact only between turns. At the next point where the work is saved (a commit, a plan or notes file), call ${toolName} with ${resumeCall}, then end the turn.`
 
 /**
+ * The size nudge's place when a commit reminder that names `resume` comes on the same result: the reminder already says
+ * what to do now, and the nudge's "at the next saved point" would read as a later commit. Only the size is added.
+ */
+export const sizeLine = (tokens: number) =>
+  `compact-timing: the context holds ${thousands(tokens)} tokens, and the plugin can compact only between turns, so this commit is the point to set the mark.`
+
+/**
  * Whether a tool result inside a turn gets the size nudge: from `softTokens`, once, and not when a resume is armed.
  * A boundary without `resume` still gets it, since the turn may keep growing after an early commit.
  */

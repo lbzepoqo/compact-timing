@@ -673,7 +673,7 @@ test('the commit reminder follows a command that committed, not one that names a
   expect(seen.gitArgs).toEqual([])
 })
 
-test('at the soft limit, only a commit reminder that names resume takes the place of the size nudge', async ($, on) => {
+test('at the soft limit, the busy commit reminder and the size nudge come together', async ($, on) => {
   world(on, $, 310_000)
   await start($)
   const context = async (command: string) => ((await $.tool.call({ tool: 'Bash', command } as never)) as { context?: string[] }).context ?? []
@@ -687,14 +687,27 @@ test('at the soft limit, only a commit reminder that names resume takes the plac
   expect(await context('ls')).toEqual([])
 })
 
-test('at the soft limit, a commit reminder without a busy mark uses up the size nudge', async ($, on) => {
+test('at the soft limit, the commit reminder that names resume comes with the size nudge, once', async ($, on) => {
   world(on, $, 310_000)
   await start($)
   const context = async (command: string) => ((await $.tool.call({ tool: 'Bash', command } as never)) as { context?: string[] }).context ?? []
   const first = await context('git commit -qm one')
-  expect(first.length).toBe(1)
+  expect(first.length).toBe(2)
   expect(first[0]).toContain('add `resume` true')
+  expect(first[1]).toContain('holds 310k tokens')
+  expect(first[1]).toContain('this commit is the point to set the mark')
+  expect((await context('git commit -qm two')).length).toBe(1)
   expect(await context('ls')).toEqual([])
+})
+
+test('at the soft limit, a commit under a resume mark gets the reminder alone', async ($, on) => {
+  world(on, $, 310_000)
+  await start($)
+  const context = async (command: string) => ((await $.tool.call({ tool: 'Bash', command } as never)) as { context?: string[] }).context ?? []
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.', resume: true })
+  const reminded = await context('git commit -qm one')
+  expect(reminded.length).toBe(1)
+  expect(reminded[0]).toContain('this commit saved work outside the conversation')
 })
 
 /**

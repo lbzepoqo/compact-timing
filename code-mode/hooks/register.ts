@@ -28,6 +28,7 @@ import {
   settleCompaction,
   shouldNudge,
   shouldRemind,
+  sizeLine,
   sizeNudge,
   skillAddResume,
   skillResumeCall,
@@ -159,7 +160,6 @@ export const register: Register = (on, options) => {
         read($, mark).catch(() => null),
         $.session.usage().then(usage => usage.context.tokens).catch(() => undefined),
       ])
-      let isResumeReminded = false
       // The scripts' reminder is given once (`ScriptRun`); also within this row, as the store may fail.
       const isScriptRow = [...calls.keys()].some(block => isScriptCallId(block.tool_use_id))
       const run = isScriptRow && shouldRemind(current, tokens, limits) ? await read($, script).catch(() => idleScript) : idleScript
@@ -170,6 +170,7 @@ export const register: Register = (on, options) => {
       const startedAt = isScriptRow && !isScriptReminded && current?.state !== 'busy' ? run.startedAt : 0
       const reflog = startedAt > 0 ? await runGit($, reflogArguments, { timeoutMs: reflogTimeout }) : null
       const endedAt = Date.now()
+      let resumeReminded: Block | undefined
       for (const [block, call] of calls) {
         if (block.is_error === true || !shouldRemind(current, tokens, limits)) continue
         const isScript = isScriptCallId(block.tool_use_id)
@@ -188,9 +189,10 @@ export const register: Register = (on, options) => {
           if (isStored && !isFirst) continue
         }
         add(block, commitReminder(markSkillName, current, skillAddResume))
-        // Only the reminder for a mark that is not busy names `resume`, so only it says what the nudge says.
-        isResumeReminded ||= current?.state !== 'busy'
+        if (current?.state !== 'busy') resumeReminded ??= block
       }
+      // The nudge comes with a commit reminder too, since only it says how many tokens the context holds. The reminder
+      // that names `resume` already says to set the mark now, so then only the size is added, in the same note.
       if (tokens !== undefined && shouldNudge(current, tokens, isNudged, limits)) {
         // Decided inside the write: rows of parallel calls arrive at the same time, and only one may send the nudge.
         let isFirst = false
@@ -199,7 +201,8 @@ export const register: Register = (on, options) => {
           return true
         }).then(() => true, () => false)
         const last = results[results.length - 1]
-        if (isStored && isFirst && !isResumeReminded && last) add(last, sizeNudge(tokens, markSkillName, skillResumeCall))
+        if (isStored && isFirst && resumeReminded) add(resumeReminded, sizeLine(tokens))
+        else if (isStored && isFirst && last) add(last, sizeNudge(tokens, markSkillName, skillResumeCall))
       }
     } catch {
       return next(e)

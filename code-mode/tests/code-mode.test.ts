@@ -497,6 +497,18 @@ test('a command that only names a commit gets no reminder', async ($, on) => {
   expect(seen.notes).toEqual([])
 })
 
+test('a commit reminder that names resume comes with the size nudge', async ($, on) => {
+  world(on, $, 320_000)
+  if (!(await isCodeModeLoaded($))) return
+  await callRow($, [{ id: 'toolu_5', name: 'Bash', input: { command: 'git commit -qm one' } }])
+  const reminded = await resultRow($, 'toolu_5', '')
+  expect(reminded).toContain('this commit saved work outside the conversation')
+  expect(reminded).toContain('holds 320k tokens')
+  expect(reminded).toContain('this commit is the point to set the mark')
+  await callRow($, [{ id: 'toolu_6', name: 'Read', input: { file_path: '/repo/a.ts' } }])
+  expect(await resultRow($, 'toolu_6', 'text', 'Read')).not.toContain('the plugin can compact only between turns')
+})
+
 test('the size nudge comes once, on the first result at softTokens', async ($, on) => {
   world(on, $, 320_000)
   if (!(await isCodeModeLoaded($))) return

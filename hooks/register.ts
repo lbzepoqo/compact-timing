@@ -34,6 +34,7 @@ import {
   settleCompaction,
   shouldNudge,
   shouldRemind,
+  sizeLine,
   sizeNudge,
   summaryReason,
   uncommittedText,
@@ -239,7 +240,8 @@ export const register: Register = (on, options) => {
     const context: string[] = []
     const isReminded = isCommitting && shouldRemind(current, tokens, limits)
     if (isReminded) context.push(commitReminder(markTool, current))
-    // Only the reminder for a mark that is not busy names `resume`, so only it says what the nudge says.
+    // The nudge comes with a commit reminder too, since only it says how many tokens the context holds. The reminder
+    // that names `resume` already says to set the mark now, so then only the size is added.
     const isResumeReminded = isReminded && current?.state !== 'busy'
     if (tokens !== undefined && shouldNudge(current, tokens, isNudged, limits)) {
       // Decided inside the write: tool hooks of parallel calls run at the same time, and only one may send the nudge.
@@ -248,7 +250,7 @@ export const register: Register = (on, options) => {
         isFirst = !previous
         return true
       }).then(() => true, () => false)
-      if (isStored && isFirst && !isResumeReminded) context.push(sizeNudge(tokens, markTool))
+      if (isStored && isFirst) context.push(isResumeReminded ? sizeLine(tokens) : sizeNudge(tokens, markTool))
     }
     return context.length ? { ...result, context: [...(result.context ?? []), ...context] } : result
   })
