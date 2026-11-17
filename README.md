@@ -37,8 +37,8 @@ At the end of each turn the plugin compacts when the context holds at least:
 | `busy` | A step is in progress whose details exist only in the conversation | never |
 
 - A `boundary` mark counts only in the turn that set it. It is dropped when that turn ends, whether or not it compacted, so it cannot trigger a compaction later in the middle of other work.
-- A `busy` mark stays until the model replaces it. Any compaction clears the mark. Each session has its own mark.
-- Interrupting a turn drops the mark and skips the compaction.
+- A `busy` mark stays until the model replaces it, also through a `/compact` (one you type, or a host's such as T3 Code's idle compaction): the plugin never compacts under it, so that compaction lands in the middle of the step. Claude Code's own compaction (`autoCompactWindow`, a prompt that is too long) still clears it, so a mark the model forgot to replace cannot hold the plugin off for the rest of the session. Before 0.15.2 any compaction cleared it. Each session has its own mark.
+- Interrupting a turn drops a `boundary` mark and skips the compaction; a `busy` mark stays.
 
 ### Compact and resume
 
@@ -65,7 +65,7 @@ Every summary of the main conversation, including the one for a `/compact` you t
 
 A third request is added when the last shell command failed, nothing was committed after it and at most 20 tool calls followed it (the mark tool's answer in pointer mode uses the same rule): if the step it belongs to is unfinished, keep what was being tried, the exact error text and what was already ruled out. The models tested do not set `busy` while debugging, so without it a compaction at `softTokens` can land inside a debugging step with nothing asking the summary to keep its details. A search that matched nothing counts as failed too, which is why the request is worded as a condition.
 
-When Claude Code compacts on its own (at `autoCompactWindow`, on a prompt that is too long, or while idle, including its precompute), or a bare `/compact` runs, whether you type it or a host sends it (T3 Code's idle compaction), the plugin passes the mark's focus as the instructions, so a `busy` step keeps what it needs. A `/compact` with text of its own keeps that text instead, and another plugin's direct compaction and a subagent's get nothing added. Before 0.15.1 (Code Mode plugin 0.2.1) a bare `/compact` got no focus.
+When Claude Code compacts on its own (at `autoCompactWindow`, on a prompt that is too long, or while idle, including its precompute), or a bare `/compact` runs, whether you type it or a host sends it (T3 Code's idle compaction), the plugin passes the mark's focus as the instructions, so a `busy` step keeps what it needs. A `/compact` with text of its own keeps that text, and a `busy` focus is added after it. A `busy` focus comes with a line asking the summarizer to keep its details only if the conversation shows the step still unfinished and your text does not say to drop them, and then to say the step is still marked `busy`, since the mark may outlive its step. Another plugin's direct compaction and a subagent's get nothing added. Before 0.15.1 (Code Mode plugin 0.2.1) a bare `/compact` got no focus, and before 0.15.2 (0.2.2) a `/compact` with text dropped it and the focus came without that line.
 
 ### How a plugin compaction shows up
 

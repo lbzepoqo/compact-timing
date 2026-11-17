@@ -8,6 +8,7 @@ import {
   afterLastCommit,
   commitSubjects,
   commitsText,
+  busyLead,
   compactInstructions,
   emptyRecord,
   filesText,
@@ -1066,12 +1067,41 @@ test('pointer mode: Claude Code compactions, a typed /compact and a subagent kee
   expect(seen.summarized).toEqual(['auto', 'precompute', 'manual', 'auto'])
 })
 
-test('a bare /compact, typed or sent by a host such as T3 Code, keeps a busy step\'s focus', async ($, on) => {
+test('a /compact, typed or sent by a host such as T3 Code, keeps a busy step\'s focus and its mark', async ($, on) => {
   const seen = world(on, $)
   await start($)
   await setMark($, { state: 'busy', focus: 'Keep the failing test name.' })
-  await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'x', toolUses: [] }] } as never)
-  expect(seen.instructions[0]).toBe(`Keep the failing test name.\n\n${openUserSteps}\n\n${transcriptSearch}`)
+  const messages = [{ role: 'user', text: 'x', toolUses: [] }]
+  await $.session.compact({ trigger: 'manual', messages } as never)
+  expect(seen.instructions[0]).toBe(`${busyLead}\n\nKeep the failing test name.\n\n${openUserSteps}\n\n${transcriptSearch}`)
+  // The busy mark outlives that compaction, so the next one, with text of its own, still gets the focus.
+  await $.session.compact({ trigger: 'manual', instructions: 'keep the plan', messages } as never)
+  expect(seen.instructions[1]).toBe(`keep the plan\n\n${busyLead}\n\nKeep the failing test name.\n\n${openUserSteps}\n\n${transcriptSearch}`)
+})
+
+test('Claude Code\'s own compaction clears a busy mark; a precompute keeps it', async ($, on) => {
+  const seen = world(on, $)
+  await start($)
+  await setMark($, { state: 'busy', focus: 'Keep the failing test name.' })
+  const messages = [{ role: 'user', text: 'x', toolUses: [] }]
+  await $.session.compact({ trigger: 'precompute', messages } as never)
+  await $.session.compact({ trigger: 'auto', messages } as never)
+  await $.session.compact({ trigger: 'manual', messages } as never)
+  const busyPart = `${busyLead}\n\nKeep the failing test name.`
+  expect(seen.instructions[0]).toBe(`${busyPart}\n\n${openUserSteps}\n\n${transcriptSearch}`)
+  expect(seen.instructions[1]).toBe(`${busyPart}\n\n${openUserSteps}\n\n${transcriptSearch}`)
+  expect(seen.instructions[2]).toBe(`${openUserSteps}\n\n${transcriptSearch}`)
+})
+
+test('a compaction clears a boundary mark', async ($, on) => {
+  const seen = world(on, $)
+  await start($)
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
+  const messages = [{ role: 'user', text: 'x', toolUses: [] }]
+  await $.session.compact({ trigger: 'auto', messages } as never)
+  await $.session.compact({ trigger: 'auto', messages } as never)
+  expect(seen.instructions[0]).toBe(`Next: deploy.\n\n${openUserSteps}\n\n${transcriptSearch}`)
+  expect(seen.instructions[1]).toBe(`${openUserSteps}\n\n${transcriptSearch}`)
 })
 
 

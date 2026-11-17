@@ -89,7 +89,7 @@ export const ruleText = (limits: Limits, isPointerMode = false, isAdaptive = fal
     isPointerMode ? `- \`focus\`: ${pointerFocus(isAdaptive)}` : '- `focus`: what the summary must keep: the next step, open decisions, file paths.',
     ...(isPointerMode ? [`- \`userSteps\`: ${pointerUserSteps}`] : []),
     '- `resume`: set it with `boundary` when steps of the current request remain. Then end the turn: the plugin compacts and sends the focus back as a prompt, so the work continues. The plugin can compact only between turns, so a long turn otherwise keeps growing.',
-    `Without a mark the plugin compacts at ${thousands(limits.softTokens)} tokens. Any compaction clears the mark.`,
+    `Without a mark the plugin compacts at ${thousands(limits.softTokens)} tokens. A \`/compact\` clears a \`boundary\` mark but not a \`busy\` one; Claude Code's own compaction clears either.`,
   ].join('\n')
 
 /**
@@ -883,16 +883,24 @@ const pointerSections = (parts: PointerParts, middle: readonly string[]) => [
 ]
 
 /**
- * Instructions for every compaction of the main conversation: the ones given, or the mark's focus when none are given
- * (Claude Code's own compaction, a bare `/compact` typed or sent by a host such as T3 Code's idle compaction), followed
- * by the request for an unfinished step when there is one (`unfinishedStep`), the open user steps and the transcript
- * search, which stays last since it names the summary's last line. Only a `busy` mark outlives its turn, so the focus
- * keeps the details of an unfinished step. The plugin's own `/compact` always gives instructions (its label).
+ * Instructions for every compaction of the main conversation: the ones given, then the mark's focus, then the request
+ * for an unfinished step when there is one (`unfinishedStep`), the open user steps and the transcript search, which
+ * stays last since it names the summary's last line.
+ * - A `busy` focus is added after any instructions given (a `/compact` with text, or a host's), with `busyLead`, since
+ *   the mark can outlive its step. The plugin never compacts under a `busy` mark, so its own `/compact` never gets it.
+ * - A `boundary` focus lives only in its turn, so it stands alone and only when no instructions are given: the
+ *   plugin's own `/compact` already holds it.
  */
 export const compactInstructions = (instructions: string | undefined, current: Mark | null, unfinished = '') => {
-  const given = instructions?.trim() || current?.focus
-  return [given, unfinished, openUserSteps, transcriptSearch].filter(Boolean).join('\n\n')
+  const given = instructions?.trim() ?? ''
+  const focus = current?.focus.trim() ?? ''
+  const focusPart = focus === '' ? '' : current?.state === 'busy' ? `${busyLead}\n\n${focus}` : given === '' ? focus : ''
+  return [given, focusPart, unfinished, openUserSteps, transcriptSearch].filter(Boolean).join('\n\n')
 }
+
+/** Put before a `busy` focus in a summary's instructions: the summarizer can see whether the step finished. */
+export const busyLead =
+  'The model marked a step as in progress (`busy`), with the focus below. If the conversation shows that step is still unfinished, keep everything the focus names, unless instructions above say to drop it, and say in the summary that the step is still marked `busy`. If the step finished, summarize as usual.'
 
 /**
  * Whether a prompt gets the context note: once when the context reaches `boundaryTokens`, and again only
@@ -1260,9 +1268,11 @@ export async function markInstructions(
 }
 
 /**
- * After a compaction: stores the outcome of the plugin's own, with what pointer mode adds to it, and clears the mark
- * when the compaction replaced the conversation (also the automatic one at the hard limit; a precompute installs
- * nothing, so the mark stays).
+ * After a compaction: stores the outcome of the plugin's own, with what pointer mode adds to it, and clears a
+ * `boundary` mark when the compaction replaced the conversation (also the automatic one at the hard limit; a
+ * precompute installs nothing). A `busy` mark stays through a `/compact` (typed, or a host's such as T3 Code's idle
+ * compaction): the plugin never compacts under it, so that one landed in the middle of the step. Claude Code's own
+ * compaction (`auto`) still clears it, so a mark the model forgot to replace cannot hold the plugin off for good.
  */
 export async function settleCompaction(
   event: HookArgs<'session.compact'>[1],
@@ -1276,7 +1286,7 @@ export async function settleCompaction(
       () => undefined,
     )
   if (event.trigger !== 'precompute' && result.skip === undefined) {
-    await cells.mark.update(() => null).catch(() => undefined)
+    await cells.mark.update(previous => (previous?.state === 'busy' && event.trigger === 'manual' ? previous : null)).catch(() => undefined)
     // The usage figure stays at the pre-compaction size until the next response, so the note is held until a prompt
     // reads a size below boundaryTokens.
     await cells.noted.update(() => true).catch(() => undefined)

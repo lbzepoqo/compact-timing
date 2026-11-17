@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { armedMark, compactInstructions, contextNote, contextNoteDue, isCommit, limitOption, markResult, openUserSteps, ownCompactFailure, parseMark, pluginCompactArgs, resumePrompt, ruleText, shouldCompact, shouldNudge, shouldRemind, sizeNudge, summaryLabel, transcriptSearch, turnEnd } from '../hooks/register'
+import { armedMark, busyLead, compactInstructions, contextNote, contextNoteDue, isCommit, limitOption, markResult, openUserSteps, ownCompactFailure, parseMark, pluginCompactArgs, resumePrompt, ruleText, shouldCompact, shouldNudge, shouldRemind, sizeNudge, summaryLabel, transcriptSearch, turnEnd } from '../hooks/register'
 
 const limits = { boundaryTokens: 200_000, softTokens: 300_000 }
 
@@ -64,14 +64,23 @@ test('an empty or misspelled limit falls back to the default', () => {
   expect(limitOption(undefined, 300_000)).toBe(300_000)
 })
 
-test('every compaction asks for the open user steps and the transcript search; one without instructions falls back to the focus', () => {
+test('every compaction asks for the open user steps and the transcript search, and keeps a busy focus behind its lead', () => {
   const busy = { state: 'busy' as const, focus: 'Keep the failing test name.', resume: false }
+  const boundary = { state: 'boundary' as const, focus: 'Next: deploy.', resume: false }
   const standing = `${openUserSteps}\n\n${transcriptSearch}`
+  const busyPart = `${busyLead}\n\nKeep the failing test name.`
   // Claude Code's own compaction, and a bare `/compact` typed or sent by a host (T3 Code's idle compaction).
-  expect(compactInstructions(undefined, busy)).toBe(`Keep the failing test name.\n\n${standing}`)
-  expect(compactInstructions(' ', busy)).toBe(`Keep the failing test name.\n\n${standing}`)
-  expect(compactInstructions('the user text', busy)).toBe(`the user text\n\n${standing}`)
+  expect(compactInstructions(undefined, busy)).toBe(`${busyPart}\n\n${standing}`)
+  expect(compactInstructions(' ', busy)).toBe(`${busyPart}\n\n${standing}`)
+  // A `/compact` with text keeps the text and adds the busy focus after it.
+  expect(compactInstructions('the user text', busy)).toBe(`the user text\n\n${busyPart}\n\n${standing}`)
+  // Text that only mentions words of the focus still gets it.
+  expect(compactInstructions('keep the test name', { ...busy, focus: 'test' })).toBe(`keep the test name\n\n${busyLead}\n\ntest\n\n${standing}`)
+  // A boundary focus stands alone and only without instructions.
+  expect(compactInstructions(undefined, boundary)).toBe(`Next: deploy.\n\n${standing}`)
+  expect(compactInstructions('the user text', boundary)).toBe(`the user text\n\n${standing}`)
   expect(compactInstructions('Next: deploy.', null)).toBe(`Next: deploy.\n\n${standing}`)
+  expect(compactInstructions(undefined, { state: 'busy', focus: '', resume: false })).toBe(standing)
   expect(compactInstructions(undefined, null)).toBe(standing)
 })
 
