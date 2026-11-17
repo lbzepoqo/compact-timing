@@ -1,6 +1,6 @@
 {
   "name": "compact-timing-code-mode",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "compact-timing for Code Mode: compacts the conversation at task boundaries instead of at a fixed token count. The model sets the mark with a skill instead of a tool, so Code Mode stays on. No pointer mode",
   "author": {
     "name": "lbzepoqo",
