@@ -122,6 +122,9 @@ test('the size nudge comes once from the soft limit, not while a resume is armed
   expect(shouldNudge({ ...boundary, resume: true }, 300_000, false, limits)).toBe(false)
   expect(shouldNudge(null, undefined, false, limits)).toBe(false)
   expect(sizeNudge(310_000, 'mcp__x__mark')).toContain('holds 310k tokens')
+  // A parallel call can get the nudge before a commit of the same response gets its reminder, so the nudge must not
+  // send the model to a later commit.
+  expect(sizeNudge(310_000, 'mcp__x__mark')).toContain("a commit that succeeded among the calls you just made counts")
 })
 
 test('a plugin compaction labels its summary', () => {
