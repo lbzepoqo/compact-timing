@@ -8,4 +8,6 @@ commit:
 gh release create v<version> --target <bump commit> --title "<version> (Code Mode <code-mode version>)" --notes "<what changed, one line per change>"
 ```
 
-Installs dont
+Installs don't read tags or releases: Claude Code takes the default branch and compares `version`. The release is the
+changelog. Then update the installed copies: `claude plugin marketplace update lbzepoqo` and
+`claude plugin update compact-timing@lbzepoqo`.
