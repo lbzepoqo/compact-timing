@@ -11,6 +11,7 @@ import {
   emptyRecord,
   filesText,
   handoffText,
+  hasCommittedLine,
   isCommitCall,
   isCommitFound,
   isCommitLogged,
@@ -220,9 +221,14 @@ export const register: Register = (on, options) => {
     const startedAt = Date.now()
     const result = await next(e)
     if (e.agentId !== undefined || result.deny !== undefined || result.isError) return result
-    // Pointer mode: whether the main agent's commit command made a commit, for the work digest. A call run in the
-    // background has only started by now.
-    const isCommitMade = isPointerMode && isCommitCommand && input.run_in_background !== true && (await isCommitFound($, String(input.command), startedAt))
+    // Pointer mode: whether a commit command made a commit, for the work digest. When git already printed its commit
+    // line, record the call without spawning git (`isCommitFound`) so the digest still finds it even if the host clips
+    // the output later.
+    const isCommitMade =
+      isPointerMode &&
+      isCommitCommand &&
+      input.run_in_background !== true &&
+      (hasCommittedLine(result.text) || (await isCommitFound($, String(input.command), startedAt)))
     if (isCommitMade)
       await update($, commitCalls, previous => [...(Array.isArray(previous) ? previous : []), e.tool_use_id].slice(-maxCommitCalls)).catch(() => undefined)
     if (isPointerMode) {

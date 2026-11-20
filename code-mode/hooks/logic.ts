@@ -213,6 +213,9 @@ export const isQuietCommit = (command: string) => quietCommitPattern.test(comman
  */
 const committedLine = /^\[[^\]\n]+ [0-9a-f]{7,40}\] /m
 
+/** Whether a shell result already holds git's commit line, so pointer mode needs no reflog read to recognize it. */
+export const hasCommittedLine = (text: string | undefined): boolean => text !== undefined && committedLine.test(text)
+
 /**
  * The newest entries of HEAD's reflog in the session's folder, each the time in seconds and what moved HEAD:
  * `HEAD@{1762934400}<tab>commit: Fix the parser`. A worktree has its own. `--no-show-signature`: a `log.showSignature`

@@ -1014,6 +1014,25 @@ test('pointer mode: the reminder follows a commit whose own output was sent away
   expect(await context('git commit -m y >/dev/null && git log -1')).toEqual([])
 })
 
+test('pointer mode: a commit that printed git\'s commit line skips reading the reflog and still marks the digest boundary', { options: pointerOnly }, async ($, on) => {
+  const command = 'git commit -m "Fix the parser"'
+  const session = reflogWorld(on, $, {
+    commits: { [command]: ['commit: Fix the parser'] },
+    result: () => ({ result: 'ok', text: '[main 5815a99] Fix the parser\n 1 file changed' }),
+  })
+  await start($)
+  const answer = (await session.run(command)) as { context?: string[] }
+  expect(answer.context?.[0]).toContain('this commit saved work outside the conversation')
+  expect(session.seen.gitArgs.filter(isReflogRead)).toEqual([])
+  // Even if the host later omits or clips the tool output in messages, commitCalls still marks the commit boundary.
+  const pointer = await session.compact(
+    { role: 'assistant', text: 'Fixing the parser.', toolUses: [session.use(command, '')] },
+    { role: 'assistant', text: 'Done.', toolUses: [] },
+  )
+  expect(pointer).toContain('## Your work after the last commit\nNothing but your last message.')
+  expect(pointer).not.toContain('Fixing the parser.')
+})
+
 test('a summary of the main conversation is asked for the unfinished step, a subagent\'s is not', async ($, on) => {
   const seen = world(on, $)
   await start($)
