@@ -11,3 +11,13 @@ gh release create v<version> --target <bump commit> --title "<version> (Code Mod
 Installs don't read tags or releases: Claude Code takes the default branch and compares `version`. The release is the
 changelog. Then update the installed copies: `claude plugin marketplace update lbzepoqo` and
 `claude plugin update compact-timing@lbzepoqo`.
+
+# Testing
+
+`bun test` fails here (no `claude-code/testing` module); run the tests through Claude Code, in the repo root and in
+`code-mode/`, and typecheck both:
+
+```sh
+claude plugin test . && (cd code-mode && claude plugin test .)
+~/.bun/bin/bunx tsc --noEmit -p . && (cd code-mode && ~/.bun/bin/bunx tsc --noEmit -p .)
+```
