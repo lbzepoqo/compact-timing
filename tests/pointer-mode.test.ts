@@ -4,6 +4,7 @@ import type { On } from 'claude-code'
 
 import {
   addFile,
+  addHostMessage,
   addRequest,
   afterLastCommit,
   commitSubjects,
@@ -29,6 +30,7 @@ import {
   reflogArguments,
   requestsText,
   resumePrompt,
+  splitPrompt,
   ruleText,
   summaryReason,
   transcriptSearch,
@@ -474,6 +476,61 @@ test('the record keeps the first three and the newest five requests and counts t
   ])
   expect(requestsText(addRequest(emptyRecord, 'line one\nline two'))).toBe('- line one\n  line two')
   expect(requestsText(emptyRecord)).toBe('None recorded.')
+})
+
+const delegated = 'Delegated task node:delegated-task:abc (Codex review run 3) [completed]:\n1. Medium: register.ts:307 drops a field'
+const prNotice = 'Update on pull request #403 (https://github.com/o/r/pull/403), which T3 Code is watching for you:\n- All 4 checks passed on 5ac3947.'
+const handoff = (typed: string) =>
+  `Context handoff (full_thread_summary):\nProvider context handoff. Thread: t1.\n[Historical user; user_message]\nUser message:\nan older quoted one\n\nUser message:\n${typed}`
+
+test("a host's messages are split from the requests the user typed", () => {
+  expect(splitPrompt('Fix the parser')).toEqual({ request: 'Fix the parser', host: null })
+  expect(splitPrompt(delegated)).toEqual({ request: null, host: delegated })
+  expect(splitPrompt(prNotice)).toEqual({ request: null, host: prNotice })
+  // A handoff's typed message is after its last `User message:` line; the rest is the host's.
+  const split = splitPrompt(handoff('work on those'))
+  expect(split.request).toBe('work on those')
+  expect(split.host).toStartWith('Context handoff (full_thread_summary):\n')
+  expect(split.host).toEndWith('an older quoted one')
+  expect(splitPrompt(handoff(prNotice))).toEqual({ request: null, host: prNotice })
+  expect(splitPrompt('Context handoff (delta_since_target_last_seen):\nno typed part')).toEqual({ request: null, host: 'Context handoff (delta_since_target_last_seen):\nno typed part' })
+  // Another agent's message to a delegated thread is that thread's task, and says who sent it.
+  const brief = '[T3 Code: the agent in T3 thread "t2" sent this message, not the user.]\n\nAct as the review sub-agent.'
+  expect(splitPrompt(brief)).toEqual({ request: brief, host: null })
+  // Only at the start: a request that quotes a notice is still the user's.
+  expect(splitPrompt(`why did this stall?\n${prNotice}`).request).toStartWith('why did this stall?')
+  // Only in the host's own wording, to the link.
+  expect(splitPrompt('Update on pull request #5 please, then merge').request).toBe('Update on pull request #5 please, then merge')
+  expect(splitPrompt('Delegated task results look wrong (see above)').request).toBe('Delegated task results look wrong (see above)')
+  expect(splitPrompt(prNotice.padEnd(2500, 'a')).host).toContain('...(cut here; the rest is in the transcript)')
+  // Nothing typed after the last `User message:` line: no request, and the older quoted one stays the host's.
+  for (const typed of ['', '  \n']) {
+    const empty = splitPrompt(handoff(typed))
+    expect(empty.request).toBeNull()
+    expect(empty.host).toEndWith('an older quoted one')
+  }
+  expect(splitPrompt(handoff('work on those').replace(/\n/g, '\r\n')).request).toBe('work on those')
+  expect(splitPrompt('   ')).toEqual({ request: null, host: null })
+})
+
+test("the requests part ends with the host's newest message, marked as not the user's", () => {
+  const one = addHostMessage(emptyRecord, prNotice)
+  expect(requestsText(one)).toBe(`Sent by the host in the user's place, not typed by the user (the only one):\n- ${prNotice.replace(/\n/g, '\n  ')}`)
+  const two = addRequest(addHostMessage(one, delegated), 'Fix the parser')
+  expect(two.hostMessages).toBe(2)
+  const text = requestsText(two)
+  expect(text).toStartWith('- Fix the parser\nSent by the host in the user\'s place, not typed by the user (the newest of 2; search the transcript for the others):\n- Delegated task')
+  expect(text).not.toContain('Update on pull request')
+  // A record stored before the host's messages were kept.
+  const legacy = { requests: ['a'], omittedRequests: 0, files: [], omittedFiles: 0 }
+  expect(requestsText(legacy)).toBe('- a')
+  expect(addHostMessage(legacy, prNotice).hostMessages).toBe(1)
+  // The count of left-out requests stays between the first and the newest, before the host's message.
+  let many = addHostMessage(emptyRecord, delegated)
+  for (let index = 1; index <= 9; index++) many = addRequest(many, `request ${index}`)
+  const lines = requestsText(many).split('\n')
+  expect(lines[3]).toBe('- ... 1 more between these; search the transcript for them')
+  expect(lines[9]).toBe("Sent by the host in the user's place, not typed by the user (the only one):")
 })
 
 test('the record lists each written file once, at most 40, and counts later writes', () => {
@@ -1163,6 +1220,22 @@ test('pointer mode: the pointer quotes the user\'s requests and lists the files 
   expect(pointer).not.toContain('/repo/x.ts')
 })
 
+test("pointer mode: the host's messages do not push the user's newest requests out", { options: pointerOnly }, async ($, on) => {
+  const seen = world(on, $)
+  await start($)
+  await prompt($, 'Fix the parser')
+  for (let index = 1; index <= 8; index++) await prompt($, index % 2 ? prNotice : delegated)
+  await prompt($, handoff('now the tests'))
+  await setMark($, { state: 'boundary', focus: 'Next: deploy.' })
+  await endTurn($)
+  const pointer = seen.installed[0] ?? ''
+  expect(pointer).toContain(
+    "## The user's requests\nVerbatim, oldest first; a later request can change an earlier one.\n- Fix the parser\n- now the tests\nSent by the host in the user's place, not typed by the user (the newest of 9; search the transcript for the others):\n- Context handoff (full_thread_summary):",
+  )
+  expect(pointer).not.toContain('Update on pull request')
+  expect(pointer).not.toContain('Delegated task')
+})
+
 test('pointer mode: a /clear starts the record over', { options: pointerOnly }, async ($, on) => {
   const seen = world(on, $)
   await start($)
@@ -1185,7 +1258,7 @@ test('pointer mode: the mark answer carries the advice only when the mark can co
   on('session.messages', () => ({ value: session }) as never)
   await start($)
   const answer = await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })
-  expect(answer.split('\n')[0]).toBe('The mark is `boundary`.')
+  expect(answer.split('\n')[0]).toStartWith('The mark is `boundary`, and the plugin compacts when this turn ends.')
   expect(answer).toContain('Pointer mode: the focus is 13 characters')
   expect(answer).toContain('your last shell command failed and nothing was committed after it (Bash: bun test tabs)')
   expect(await markAnswer($, { state: 'busy', focus: 'Next: deploy.' })).toBe('The mark is `busy`.')
@@ -1202,7 +1275,9 @@ test('pointer mode off: the mark answer has no advice', async ($, on) => {
   world(on, $)
   on('session.messages', () => ({ value: session }) as never)
   await start($)
-  expect(await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })).toBe('The mark is `boundary`.')
+  const answer = await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })
+  expect(answer).toStartWith('The mark is `boundary`, and the plugin compacts when this turn ends.')
+  expect(answer).not.toContain('Pointer mode')
 })
 
 test('pointer mode: when the messages cannot be read the mark is still set', { options: pointerOnly }, async ($, on) => {
@@ -1211,7 +1286,7 @@ test('pointer mode: when the messages cannot be read the mark is still set', { o
     throw new Error('no transcript')
   })
   await start($)
-  expect(await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })).toBe('The mark is `boundary`.')
+  expect(await markAnswer($, { state: 'boundary', focus: 'Next: deploy.' })).toStartWith('The mark is `boundary`, and the plugin compacts')
   await endTurn($)
   expect(seen.installed[0]).toContain('## Your work since the conversation started or was last compacted\n')
 })

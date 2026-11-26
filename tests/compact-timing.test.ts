@@ -111,6 +111,15 @@ test('the mark answer says to end the turn only when a resume can compact', () =
   expect(markResult({ state: 'busy', focus: '', resume: false }, 400_000, limits)).toBe('The mark is `busy`.')
 })
 
+test('a boundary without resume that compacts says nothing runs until a new prompt', () => {
+  const boundary = { state: 'boundary' as const, focus: '', resume: false }
+  const answer = markResult(boundary, 200_000, limits)
+  expect(answer).toContain('Nothing runs after that until a new prompt arrives')
+  expect(answer).toContain('wait for it in this turn, or set `resume`')
+  expect(markResult(boundary, 150_000, limits)).toBe('The mark is `boundary`.')
+  expect(markResult(boundary, undefined, limits)).toBe('The mark is `boundary`.')
+})
+
 test('the size nudge comes once from the soft limit, not while a resume is armed', () => {
   const boundary = { state: 'boundary' as const, focus: '', resume: false }
   const busy = { state: 'busy' as const, focus: '', resume: false }

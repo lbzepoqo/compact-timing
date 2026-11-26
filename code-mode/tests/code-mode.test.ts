@@ -252,7 +252,7 @@ const callSkill = async ($: Engine, args: string, agentId?: string) => {
 test('the skill sets a boundary that compacts at the end of the turn', async ($, on) => {
   const seen = world(on, $, 250_000)
   if (!(await isCodeModeLoaded($))) return
-  expect(await callSkill($, 'boundary\nNext: deploy.')).toBe('The mark is `boundary`.')
+  expect(await callSkill($, 'boundary\nNext: deploy.')).toStartWith('The mark is `boundary`, and the plugin compacts when this turn ends.')
   await endTurn($)
   expect(seen.compacts).toHaveLength(1)
   expect(seen.compacts[0]).toContain('at a `boundary` mark')
@@ -290,7 +290,7 @@ test("a subagent's JavaScript in between does not make the main call a subagent'
   // The main model calls the skill while a background subagent runs Code Mode steps.
   await callRow($, [{ id: 'toolu_10', name: 'Skill', input: { skill: markSkill, args: 'boundary\nNext: deploy.' } }])
   await callRow($, [{ id: 'toolu_11', name: 'REPL', input: { code: 'await tools.Read({ file_path: "a" })' } }], 'agent-1')
-  expect((await $.skill.prompt({ skill: markSkill, text: skillText('boundary\nNext: deploy.') } as never)).text).toBe('The mark is `boundary`.')
+  expect((await $.skill.prompt({ skill: markSkill, text: skillText('boundary\nNext: deploy.') } as never)).text).toStartWith('The mark is `boundary`, and the plugin compacts when this turn ends.')
   // The subagent's JavaScript calls the skill while the main model runs a step of its own.
   await callRow($, [{ id: 'toolu_12', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: 'busy' })` } }], 'agent-1')
   await callRow($, [{ id: 'toolu_13', name: 'REPL', input: { code: 'await tools.Bash({ command: "ls" })' } }])
@@ -309,7 +309,7 @@ test("two agents' waiting scripts are matched by the arguments their code gives"
   // The main script calls the skill, and a subagent's script, made later, waits too: the newest is the subagent's.
   await callRow($, [{ id: 'toolu_16', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: 'boundary\\nNext: deploy.' })` } }])
   await callRow($, [{ id: 'toolu_17', name: 'REPL', input: { code: `await tools.Skill({ skill: '${markSkill}', args: 'busy\\nSub.' })` } }], 'agent-3')
-  expect((await $.skill.prompt({ skill: markSkill, text: skillText('boundary\nNext: deploy.') } as never)).text).toBe('The mark is `boundary`.')
+  expect((await $.skill.prompt({ skill: markSkill, text: skillText('boundary\nNext: deploy.') } as never)).text).toStartWith('The mark is `boundary`, and the plugin compacts when this turn ends.')
   expect((await $.skill.prompt({ skill: markSkill, text: skillText('busy\nSub.') } as never)).text).toBe('Only the main conversation sets the compaction mark.')
   await endTurn($)
   expect(seen.compacts).toHaveLength(1)

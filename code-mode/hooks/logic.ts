@@ -36,7 +36,16 @@ export type PointerParts = {
 }
 // Pointer mode: the user's requests and the files written, which the focus may paraphrase or leave out. Recorded as the
 // session runs, because the plugin cannot read a long transcript (`$.fs.read` stops at 4 MiB). A `/clear` starts it over.
-export type SessionRecord = { requests: string[]; omittedRequests: number; files: string[]; omittedFiles: number }
+// The host's messages are kept apart from the requests: only the newest, and a count. A record stored before they were
+// kept has neither field.
+export type SessionRecord = {
+  requests: string[]
+  omittedRequests: number
+  files: string[]
+  omittedFiles: number
+  hostMessage?: string
+  hostMessages?: number
+}
 export const emptyRecord: SessionRecord = { requests: [], omittedRequests: 0, files: [], omittedFiles: 0 }
 export const maxCommitCalls = 200
 // The reflog read runs after the call, before its result goes back to the model.
@@ -116,6 +125,10 @@ export const markSchema = (isPointerMode = false) => ({
 
 /** The mark tool's answer: with `resume` it says whether to end the turn now, since that depends on the size. */
 export const markResult = (current: Mark, tokens: number | undefined, limits: Limits): string => {
+  // Twice a model set `boundary` while a pull request's CI ran, then ended the turn waiting for a run that no notice
+  // would report, and the thread sat idle after the compaction until the user asked whether it was stuck.
+  if (!current.resume && current.state === 'boundary' && tokens !== undefined && tokens >= limits.boundaryTokens)
+    return 'The mark is `boundary`, and the plugin compacts when this turn ends. Nothing runs after that until a new prompt arrives: if you are waiting for something (CI, a pull request, a background task), end the turn only when something will send a prompt once it is done; otherwise wait for it in this turn, or set `resume` if steps remain.'
   if (!current.resume) return `The mark is \`${current.state}\`.`
   if (tokens !== undefined && tokens >= limits.boundaryTokens)
     return 'The mark is `boundary`. End your turn now with a one-line status and no question: the plugin compacts and then sends the focus back as a prompt, so you continue from it.'
@@ -487,6 +500,40 @@ export const userRequest = (prompt: string): string | null => {
   return text.length > maxRequestLength ? `${text.slice(0, maxRequestLength)} ...(cut here; the rest is in the transcript)` : text
 }
 
+/**
+ * An SDK host such as T3 Code sends messages of its own as prompts: the result of a task delegated to another agent, a
+ * notice on a pull request it watches, and a context handoff when a thread moves to another provider. Quoted as requests
+ * they filled the newest five, and the user's own latest words fell out. A handoff ends with the message the user typed,
+ * after its last `User message:` line, so that part is the request. A message another agent sends to a delegated thread
+ * stays a request: it is that thread's task, and its first line already says who sent it.
+ */
+// T3 Code's own wording, to the link, so a request the user types that starts the same way stays a request.
+const hostNotice = /^(?:Delegated task node:delegated-task:\S+ \(|Update on pull request #\d+ \(https:\/\/\S+\), which )/
+const handoffStart = /^Context handoff \([a-z_]+\):\n/
+const handoffUserMessage = '\nUser message:\n'
+
+/** A prompt split into the request the user typed and the message the host sent, each as the record keeps it or null. */
+export const splitPrompt = (prompt: string): { request: string | null; host: string | null } => {
+  const text = prompt.replace(/\r\n?/g, '\n').trim()
+  if (hostNotice.test(text)) return { request: null, host: userRequest(text) }
+  if (!handoffStart.test(text)) return { request: userRequest(text), host: null }
+  // The trim took the line break after a `User message:` line with nothing typed after it (a prompt of attachments only),
+  // and without it the search would find an older message quoted in the handoff.
+  const untrimmed = `${text}\n`
+  const at = untrimmed.lastIndexOf(handoffUserMessage)
+  if (at < 0) return { request: null, host: userRequest(text) }
+  // The typed part is classified too, in case the host wrapped one of its own notices.
+  const typed = splitPrompt(untrimmed.slice(at + handoffUserMessage.length))
+  return { request: typed.request, host: typed.host ?? userRequest(text.slice(0, at)) }
+}
+
+/** Keeps the newest message the host sent and counts them all. */
+export const addHostMessage = (record: SessionRecord, message: string): SessionRecord => ({
+  ...record,
+  hostMessage: message,
+  hostMessages: (record.hostMessages ?? 0) + 1,
+})
+
 /** Adds a request: the first few and the newest few are kept, the ones between only counted. */
 export const addRequest = (record: SessionRecord, request: string): SessionRecord => {
   const requests = [...record.requests, request]
@@ -509,13 +556,22 @@ export const writtenPath = (tool: string, input: Record<string, unknown>): strin
   return typeof path === 'string' && path.trim() !== '' ? path.trim() : null
 }
 
-/** The requests part of the pointer, oldest first, with a count where some were left out. */
+const listItem = (text: string) => `- ${text.replace(/\n/g, '\n  ')}`
+
+/**
+ * The requests part of the pointer, oldest first, with a count where some were left out, then the newest message the
+ * host sent, marked as not the user's.
+ */
 export const requestsText = (record: SessionRecord): string => {
-  if (record.requests.length === 0) return 'None recorded.'
-  const lines = record.requests.map(request => `- ${request.replace(/\n/g, '\n  ')}`)
+  const lines = record.requests.map(listItem)
   if (record.omittedRequests > 0)
     lines.splice(firstRequests, 0, `- ... ${record.omittedRequests} more between these; search the transcript for them`)
-  return lines.join('\n')
+  if (record.hostMessage) {
+    const count = record.hostMessages ?? 1
+    const which = count > 1 ? `the newest of ${count}; search the transcript for the others` : 'the only one'
+    lines.push(`Sent by the host in the user's place, not typed by the user (${which}):`, listItem(record.hostMessage))
+  }
+  return lines.length === 0 ? 'None recorded.' : lines.join('\n')
 }
 
 /** The files part of the pointer, in the order first written. */

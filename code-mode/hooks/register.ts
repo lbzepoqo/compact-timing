@@ -243,7 +243,7 @@ export const register: Register = (on, options) => {
     if ((call as MarkCall | undefined)?.agentId !== undefined) return { text: 'Only the main conversation sets the compaction mark.' }
     const parsed = parseMarkArgs(e.text)
     if (!parsed) return { text: 'The mark was not set: the first line of the arguments must be `boundary` or `busy`.' }
-    const tokens = parsed.resume ? await $.session.usage().then(usage => usage.context.tokens).catch(() => undefined) : undefined
+    const tokens = parsed.resume || parsed.state === 'boundary' ? await $.session.usage().then(usage => usage.context.tokens).catch(() => undefined) : undefined
     const isStored = await update($, mark, () => armedMark(parsed, tokens, limits)).then(() => true, () => false)
     if (!isStored) return { text: 'The mark was not set: the plugin could not store it.' }
     return { text: markResult(parsed, tokens, limits) }

@@ -9,7 +9,7 @@ declare module 'claude-code' {
       ownCompact: 'pending' | { skip: string | null; isPointer?: boolean; summaryReason?: string } | null
       pointer: { tokens: number; focus: string; userSteps: string; requests: string; files: string; uncommitted: string; transcriptPath: string; commits: string } | null
       transcriptPath: string
-      sessionRecord: { requests: string[]; omittedRequests: number; files: string[]; omittedFiles: number }
+      sessionRecord: { requests: string[]; omittedRequests: number; files: string[]; omittedFiles: number; hostMessage?: string; hostMessages?: number }
       // Pointer mode: the ids of the shell calls whose commit HEAD's reflog shows.
       commitCalls: string[]
     }

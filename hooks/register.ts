@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginState, Register, SessionCompactResult, StateDollar } from 'claude-code'
 import {
   addFile,
+  addHostMessage,
   addRequest,
   armedMark,
   commitReminder,
@@ -37,10 +38,10 @@ import {
   shouldRemind,
   sizeLine,
   sizeNudge,
+  splitPrompt,
   summaryReason,
   uncommittedText,
   unreadRecord,
-  userRequest,
   workPart,
   writtenPath,
 } from '../code-mode/hooks/logic'
@@ -199,7 +200,7 @@ export const register: Register = (on, options) => {
       const parsed = parseMark(isPointerMode ? input : { ...input, userSteps: undefined })
       if (!parsed) return { result: 'The mark was not set: state must be `boundary` or `busy`.' }
       const isPointerMark = isPointerMode && parsed.state === 'boundary'
-      const tokens = parsed.resume || isPointerMark ? await $.session.usage().then(usage => usage.context.tokens).catch(() => undefined) : undefined
+      const tokens = parsed.resume || parsed.state === 'boundary' ? await $.session.usage().then(usage => usage.context.tokens).catch(() => undefined) : undefined
       const stored = armedMark(parsed, tokens, limits)
       await update($, mark, () => stored)
       // Only when this mark can compact: below boundaryTokens, or at an unknown size, no pointer is made and the
@@ -268,11 +269,16 @@ export const register: Register = (on, options) => {
     return result
   })
 
-  // Pointer mode records each request the user typed, for the pointer to quote.
+  // Pointer mode records each request the user typed, for the pointer to quote, and the newest message the host sent.
   on('prompt.submit', ($, e, next) =>
     promptWithNote($, e, next, turnCells($), limits, isContextNoteOn, markTool, async () => {
-      const request = isPointerMode ? userRequest(e.text) : null
-      if (request !== null) await update($, sessionRecord, previous => addRequest(previous, request))
+      if (!isPointerMode) return
+      const { request, host } = splitPrompt(e.text)
+      if (request === null && host === null) return
+      await update($, sessionRecord, previous => {
+        const withHost = host === null ? previous : addHostMessage(previous, host)
+        return request === null ? withHost : addRequest(withHost, request)
+      })
     }),
   )
 
