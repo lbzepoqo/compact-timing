@@ -62,7 +62,7 @@ The model often forgets the tool, so the plugin adds short notes at the moments 
 Every summary of the main conversation, including the one for a `/compact` you type and Claude Code's own, gets two extra requests:
 
 - **Your open steps.** Keep each step, command or question the model gave you that you have not yet reported done or answered, commands exact. Claude Code's summary lists the model's own pending tasks but not yours; in one session it dropped a four-step test the model had just asked for, and the model then denied asking.
-- **How to search the transcript.** End with a `command grep -oE` line that shows 200 characters around a term, since the transcript's lines are long JSON records.
+- **How to search the transcript.** End with a `command grep -oE` line that shows 200 characters around a term (noting to keep `command`, since Claude Code's shell may shadow bare `grep` with `ugrep`, which rejects `.{0,200}` as too complex), since the transcript's lines are long JSON records.
 
 A third request is added when the last shell command failed, nothing was committed after it and at most 20 tool calls followed it (the mark tool's answer in pointer mode uses the same rule): if the step it belongs to is unfinished, keep what was being tried, the exact error text and what was already ruled out. The models tested do not set `busy` while debugging, so without it a compaction at `softTokens` can land inside a debugging step with nothing asking the summary to keep its details. A search that matched nothing counts as failed too, which is why the request is worded as a condition.
 

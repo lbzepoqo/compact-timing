@@ -478,11 +478,12 @@ export const openUserSteps =
 
 /**
  * Claude Code appends the transcript path to the summary and says to read it, but a transcript holds one long JSON
- * record per line, so reading it whole refills the context the compaction freed. `command` skips a shell function
- * named grep (such as one calling ugrep, which rejects this window as too complex).
+ * record per line, so reading it whole refills the context the compaction freed. `command` skips Claude Code's shell
+ * function shadowing `grep` with ugrep (which rejects `.{0,200}` as too complex); spelling that out stops models
+ * from dropping `command` when they run the search.
  */
 export const transcriptSearchHow =
-  "search the full transcript with command grep -oE '.{0,200}<term>.{0,200}' rather than reading it whole: each line is one long JSON record."
+  "search the full transcript with `command grep -oE '.{0,200}<term>.{0,200}'` (in Bash, keep `command`: bare `grep` may be shadowed by ugrep, which rejects `.{0,200}` as too complex) rather than reading it whole: each line is one long JSON record."
 export const transcriptSearch = `End the summary with this line: "For exact details the summary dropped (error text, paths, numbers), ${transcriptSearchHow}"`
 
 const maxCommitLines = 40

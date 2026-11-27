@@ -84,9 +84,9 @@ test('userSteps is kept only with boundary and only when given', () => {
   expect(parseMark({ state: 'boundary', userSteps: '  ' })).toEqual({ state: 'boundary', focus: '', resume: false })
 })
 
-test('the summary transcript line is unchanged by the split', () => {
+test('the summary transcript line keeps command grep and explains why', () => {
   expect(transcriptSearch).toBe(
-    "End the summary with this line: \"For exact details the summary dropped (error text, paths, numbers), search the full transcript with command grep -oE '.{0,200}<term>.{0,200}' rather than reading it whole: each line is one long JSON record.\"",
+    "End the summary with this line: \"For exact details the summary dropped (error text, paths, numbers), search the full transcript with `command grep -oE '.{0,200}<term>.{0,200}'` (in Bash, keep `command`: bare `grep` may be shadowed by ugrep, which rejects `.{0,200}` as too complex) rather than reading it whole: each line is one long JSON record.\"",
   )
 })
 
